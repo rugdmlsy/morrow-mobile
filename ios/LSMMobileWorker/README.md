@@ -59,7 +59,7 @@ QR/barcode scanning is deliberately different from `camera_capture`: a remote ca
 
 - `send_to_mobile`: deliver bounded text, an HTTP/HTTPS URL, or a file already present in `Documents/LSM` into the phone's local LSM Inbox.
 - `inbox_list`: inspect the bounded local inbox.
-- The app has read-only **Machines & active jobs**, **LSM Inbox**, and **Controller Events** screens.
+- The app has read-only **Machines & active jobs**, **LSM Inbox**, and **Quota Reset Notifications** (5h / 1 week) screens.
 - The dashboard uses the worker's existing bearer identity and returns sanitized status/job metadata; it does not expose shell commands, output, controller OAuth credentials, or other worker credentials.
 
 `notify` and `send_to_mobile` support controller-side deferred delivery. When the iPhone is suspended/offline and `defer_if_offline=true`, the controller stores a bounded, TTL-limited event and hands it to the authenticated iOS poll channel when the app next wakes. Event IDs are acknowledged and durably deduplicated so reconnects do not replay the same notification indefinitely.
@@ -168,11 +168,13 @@ Ordinary remote jobs preserve the old offline behavior when APNs is absent: they
 
 LSM cannot observe ChatGPT's exact platform-side per-turn execution budget and does not receive an official "turn timeout" callback. The controller therefore does **not** claim to know the platform countdown.
 
-For an active Goal, LSM already maintains its own 30-minute execution lease (`PLAN_EXECUTION_LEASE_S = 900`). Phase 4 runs an independent controller watchdog: when a Goal is still unfinished, has no in-flight tool calls, and crosses that lease without fresh agent activity, the controller queues an `agent_interrupted_or_expired` event for mobile workers. The notification explicitly says that the ChatGPT turn **may** have been interrupted and that auto-continuation is due. If the configured continuation budget is exhausted while work remains, a separate attention event is queued.
+## Quota-reset notifications (5h / 1 week)
 
-Tracked shell jobs are deterministic. `job_start(..., notify_on_finish=true)` now produces a stable `job_completed` event when that attempt reaches a terminal state; the controller/mobile pipeline acknowledges and deduplicates it. New remote Mac/Linux workers forward their opt-in completion events independently of the ChatGPT turn, so the notification can still be generated after the original assistant execution has stopped. Historical jobs created before this delivery mechanism are not replayed on upgrade.
-
-With the current Personal Team build, these events are durable but cannot APNs-wake a fully suspended iPhone. If the app is foreground/polling they normally arrive within one poll cycle; otherwise they appear when the app next receives background runtime or is opened. A future push-capable Developer Team can use the already implemented APNs wake path for lower-latency delivery.
+Morrow Mobile includes a native AI quota reset notification system:
+- Tracks burst rolling rate limits (**5-hour** reset window) and weekly total limits (**1-week** / 7-day budget).
+- Schedules reliable local notifications via `UNUserNotificationCenter` that fire even when the app is backgrounded or closed.
+- Integrates directly with the multi-account system (`antigravity-0`, `antigravity-1`, `codex-1`), with real-time countdown progress and target timestamp calculations.
+- Legacy controller job completion notifications (`job_completed`) have been replaced by this quota management pipeline.
 
 ## Pairing
 

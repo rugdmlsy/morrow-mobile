@@ -47,12 +47,15 @@ struct LSMHTTPClient {
     }
 
     func resume(identity: WorkerIdentity) async throws -> WorkerSessionSettings {
-        let payload: [String: Any] = [
-            "name": identity.name,
+        var payload: [String: Any] = [
             "workdir": "Documents/LSM",
             "capabilities": MobileActionExecutor.capabilities,
             "info": MobileActionExecutor.workerInfo(),
         ]
+        let cleanName = identity.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanName.isEmpty && !cleanName.lowercased().hasPrefix("antigravity-") && !cleanName.lowercased().hasPrefix("codex-") {
+            payload["name"] = cleanName
+        }
         let data = try await post(
             server: identity.server,
             path: "/remote/resume",
@@ -197,6 +200,9 @@ final class WorkerViewModel: ObservableObject {
     @Published private(set) var paired = false
     @Published private(set) var lastAction = "None"
 
+    @Published var accounts: [WorkerIdentity] = []
+    @Published var activeIdentity: WorkerIdentity?
+
     private let http = LSMHTTPClient()
     let executor = MobileActionExecutor()
     private var identity: WorkerIdentity?
@@ -206,13 +212,113 @@ final class WorkerViewModel: ObservableObject {
     init() {
         server = UserDefaults.standard.string(forKey: "controller.server") ?? "https://mcp.xycdev.com"
         workerName = UserDefaults.standard.string(forKey: "worker.name") ?? "morrow-iphone"
-        if let data = try? KeychainStore.load(),
-           let saved = try? JSONDecoder().decode(WorkerIdentity.self, from: data) {
+        reloadAccounts()
+    }
+
+    func reloadAccounts() {
+        accounts = KeychainStore.loadAllIdentities()
+        if let saved = KeychainStore.loadCurrentIdentity() {
+            activeIdentity = saved
             identity = saved
             server = saved.server
             workerName = saved.name
             paired = true
+            let acct = saved.name.isEmpty ? "antigravity-0" : saved.name
+            if MobileChatStore.shared.currentAccount != acct {
+                MobileChatStore.shared.switchAccount(server: saved.server, token: saved.token, account: acct)
+            }
+        } else {
+            activeIdentity = nil
+            identity = nil
+            paired = false
         }
+    }
+
+    func switchToAccount(_ account: WorkerIdentity, force: Bool = false) {
+        if !force && account.id == activeIdentity?.id && connected { return }
+        disconnect()
+
+        // 1. Persist new active identity to Keychain
+        try? KeychainStore.switchIdentity(to: account)
+
+        // 2. Update published state immediately
+        activeIdentity = account
+        identity = account
+        server = account.server
+        workerName = account.name
+        paired = true
+
+        UserDefaults.standard.set(account.server, forKey: "controller.server")
+        UserDefaults.standard.set(account.name, forKey: "worker.name")
+
+        // 3. Refresh accounts list
+        accounts = KeychainStore.loadAllIdentities()
+
+        // 4. Switch chat store to this account synchronously
+        let acct = account.name.isEmpty ? "antigravity-0" : account.name
+        MobileChatStore.shared.switchAccount(server: account.server, token: account.token, account: acct)
+
+        // 5. Connect worker socket
+        connect()
+
+        // 6. Sync push registration in background
+        Task {
+            await WorkerBackgroundCoordinator.shared.syncPushRegistration(identity: account)
+        }
+    }
+
+    func addOrSwitchProfile(name: String) {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty else { return }
+        if let existing = accounts.first(where: { $0.name.lowercased() == cleanName.lowercased() }) {
+            switchToAccount(existing, force: true)
+            return
+        }
+        guard let current = activeIdentity ?? KeychainStore.loadCurrentIdentity() else { return }
+        let newIdentity = WorkerIdentity(
+            server: current.server,
+            name: cleanName,
+            token: current.token
+        )
+        try? KeychainStore.saveCurrentIdentity(newIdentity)
+        accounts = KeychainStore.loadAllIdentities()
+        switchToAccount(newIdentity, force: true)
+    }
+
+    func removeAccount(_ account: WorkerIdentity) {
+        let wasActive = (activeIdentity?.id == account.id)
+        if wasActive {
+            disconnect()
+        }
+        let next = try? KeychainStore.removeIdentity(account)
+        reloadAccounts()
+        if wasActive {
+            if let next {
+                switchToAccount(next)
+            } else {
+                unpair()
+            }
+        }
+    }
+
+    func pairNewAccount(server: String, invite: String, name: String) async throws {
+        disconnect()
+        let cleanServer = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanInvite = invite.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanServer.isEmpty, !cleanInvite.isEmpty, !cleanName.isEmpty else {
+            throw WorkerClientError.missingInvite
+        }
+
+        let result = try await http.register(server: cleanServer, invite: cleanInvite, name: cleanName)
+        let newIdentity = result.0
+        try persistIdentity(newIdentity)
+        reloadAccounts()
+        UserDefaults.standard.set(newIdentity.server, forKey: "controller.server")
+        UserDefaults.standard.set(newIdentity.name, forKey: "worker.name")
+        connect()
+        await WorkerBackgroundCoordinator.shared.syncPushRegistration(identity: newIdentity)
+        MobileChatStore.shared.switchAccount(server: newIdentity.server, token: newIdentity.token, account: newIdentity.name)
     }
 
     func startIfConfigured() {
@@ -256,11 +362,13 @@ final class WorkerViewModel: ObservableObject {
 
     func unpair() {
         disconnect()
-        KeychainStore.clear()
-        identity = nil
-        paired = false
-        invite = ""
-        detail = "Pairing identity removed from Keychain."
+        if let current = activeIdentity {
+            _ = try? KeychainStore.removeIdentity(current)
+        } else {
+            KeychainStore.clear()
+        }
+        reloadAccounts()
+        detail = "Pairing identity removed."
     }
 
     func requestNotificationPermission() async {
@@ -328,12 +436,14 @@ final class WorkerViewModel: ObservableObject {
                 }
                 let result = try await http.register(server: server, invite: invite, name: workerName)
                 identity = result.0
+                activeIdentity = result.0
                 sessionSettings = result.1
                 try persistIdentity(result.0)
                 paired = true
                 workerName = result.0.name
                 server = result.0.server
                 invite = ""
+                reloadAccounts()
                 await WorkerBackgroundCoordinator.shared.syncPushRegistration(identity: result.0)
             } else if let identity {
                 sessionSettings = try await http.resume(identity: identity)
@@ -386,12 +496,8 @@ final class WorkerViewModel: ObservableObject {
         } catch {
             status = "Error"
             detail = error.localizedDescription
-            if case WorkerClientError.controller(let message) = error,
-               message.localizedCaseInsensitiveContains("identity") {
-                KeychainStore.clear()
-                identity = nil
-                paired = false
-            }
+            connected = false
+            WorkerStatusStore.recordConnected(false)
         }
     }
 
@@ -406,7 +512,6 @@ final class WorkerViewModel: ObservableObject {
     }
 
     private func persistIdentity(_ identity: WorkerIdentity) throws {
-        let data = try JSONEncoder().encode(identity)
-        try KeychainStore.save(data)
+        try KeychainStore.saveCurrentIdentity(identity)
     }
 }

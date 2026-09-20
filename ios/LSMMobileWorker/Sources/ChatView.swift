@@ -59,6 +59,13 @@ struct ChatView: View {
 
 // MARK: - Level 1: Projects List View (Telegram Forum Groups)
 
+struct MessageSearchResult: Identifiable {
+    var id: String { "\(session.id)_\(message.id)" }
+    let message: ChatMessageItem
+    let session: ChatSessionItem
+    let snippet: String
+}
+
 struct ChatProjectsListView: View {
     @ObservedObject var model: WorkerViewModel
     @Binding var navigationPath: NavigationPath
@@ -68,6 +75,13 @@ struct ChatProjectsListView: View {
     @State private var isShowingNewProjectAlert: Bool = false
     @State private var newProjectName: String = ""
     @State private var projectToDelete: ChatProjectItem? = nil
+    enum AccountSheetType: Identifiable {
+        case switcher
+        case add
+
+        var id: Int { hashValue }
+    }
+    @State private var activeAccountSheet: AccountSheetType? = nil
 
     private var token: String? {
         if let data = try? KeychainStore.load(),
@@ -77,54 +91,147 @@ struct ChatProjectsListView: View {
         return nil
     }
 
-    private var filteredProjects: [ChatProjectItem] {
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if query.isEmpty {
-            return chatStore.projects
-        }
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var searchTrimmed: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var matchingProjects: [ChatProjectItem] {
+        guard isSearching else { return [] }
+        let query = searchTrimmed
         return chatStore.projects.filter { proj in
-            proj.name.lowercased().contains(query) ||
-            proj.latestSnippet.lowercased().contains(query)
+            proj.name.localizedCaseInsensitiveContains(query)
         }
     }
 
-    var body: some View {
-        VStack(spacing: 0) {
-            // Telegram connectivity header
-            telegramStatusBar
+    private var matchingSessions: [ChatSessionItem] {
+        guard isSearching else { return [] }
+        let query = searchTrimmed
+        return chatStore.sessions.filter { s in
+            s.title.localizedCaseInsensitiveContains(query) ||
+            s.projectName.localizedCaseInsensitiveContains(query) ||
+            s.lastMessageSnippet.localizedCaseInsensitiveContains(query)
+        }
+    }
 
-            if filteredProjects.isEmpty && !searchText.isEmpty {
-                emptySearchResultView
+    private var matchingMessages: [MessageSearchResult] {
+        guard isSearching else { return [] }
+        let query = searchTrimmed
+        var results: [MessageSearchResult] = []
+        for session in chatStore.sessions {
+            let msgs = chatStore.messages(for: session.id)
+            for msg in msgs.reversed() {
+                if msg.content.localizedCaseInsensitiveContains(query) {
+                    let snip = makeSnippet(content: msg.content, query: query)
+                    results.append(MessageSearchResult(message: msg, session: session, snippet: snip))
+                    if results.count >= 40 { break }
+                }
+            }
+            if results.count >= 40 { break }
+        }
+        return results
+    }
+
+    private var hasSearchResults: Bool {
+        !matchingProjects.isEmpty || !matchingSessions.isEmpty || !matchingMessages.isEmpty
+    }
+
+    var body: some View {
+        ZStack {
+            if isSearching {
+                if hasSearchResults {
+                    searchResultsListView
+                } else {
+                    emptySearchResultView
+                }
             } else if chatStore.projects.isEmpty {
                 emptyProjectsView
             } else {
-                List {
-                    ForEach(filteredProjects) { project in
-                        NavigationLink(value: project) {
-                            ProjectRowView(project: project)
-                        }
-                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            if project.id != "outside-of-project" && project.id != "default-cli-project" {
-                                Button(role: .destructive) {
-                                    projectToDelete = project
-                                } label: {
-                                    Label("删除项目", systemImage: "trash")
+                projectsListView
+            }
+        }
+        .navigationTitle("Project")
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $searchText, prompt: "搜索项目、对话或消息")
+        .toolbar {
+            ToolbarItem(placement: .navigationBarLeading) {
+                Menu {
+                    Section("选择 Agent 账号") {
+                        ForEach(model.accounts) { account in
+                            let isActive = (account.name.lowercased() == (model.activeIdentity?.name ?? model.workerName).lowercased())
+                            Button {
+                                if !isActive {
+                                    model.switchToAccount(account)
+                                }
+                            } label: {
+                                if isActive {
+                                    Label(account.agentDisplayName, systemImage: "checkmark.circle.fill")
+                                } else {
+                                    Label(account.agentDisplayName, systemImage: account.agentIcon)
                                 }
                             }
                         }
                     }
+
+                    Section {
+                        Button {
+                            Task {
+                                await chatStore.sync(server: model.server, token: token)
+                            }
+                        } label: {
+                            Label("立即刷新数据", systemImage: "arrow.clockwise")
+                        }
+
+                        Button {
+                            activeAccountSheet = .switcher
+                        } label: {
+                            Label("管理账号...", systemImage: "person.2.badge.gearshape")
+                        }
+
+                        Button {
+                            activeAccountSheet = .add
+                        } label: {
+                            Label("添加新账号...", systemImage: "plus.circle")
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: model.activeIdentity?.agentIcon ?? "atom")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                        Text(model.activeIdentity?.name ?? "antigravity-0")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.primary)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color(uiColor: .tertiarySystemFill))
+                    .clipShape(Capsule())
                 }
-                .listStyle(.plain)
-                .refreshable {
-                    await chatStore.sync(server: model.server, token: token)
+                .accessibilityLabel("切换账号")
+            }
+
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 2) {
+                    Text("Project")
+                        .font(.system(size: 16, weight: .bold))
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(model.connected ? Color.green : Color.orange)
+                            .frame(width: 6, height: 6)
+                        Text(model.connected ? "MacBook 已在线" : "等待连接...")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
-        }
-        .navigationTitle("Project")
-        .navigationBarTitleDisplayMode(.large)
-        .searchable(text: $searchText, prompt: "搜索项目或对话内容")
-        .toolbar {
+
             ToolbarItemGroup(placement: .navigationBarTrailing) {
                 Button {
                     newProjectName = ""
@@ -145,6 +252,14 @@ struct ChatProjectsListView: View {
                     Image(systemName: "square.and.pencil")
                         .font(.system(size: 16, weight: .semibold))
                 }
+            }
+        }
+        .sheet(item: $activeAccountSheet) { sheet in
+            switch sheet {
+            case .switcher:
+                AccountSwitcherView(model: model)
+            case .add:
+                AddAccountSheet(model: model)
             }
         }
         .alert("新建项目", isPresented: $isShowingNewProjectAlert) {
@@ -184,34 +299,133 @@ struct ChatProjectsListView: View {
         }
     }
 
-    private var telegramStatusBar: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(model.connected ? Color.green : Color.orange)
-                .frame(width: 8, height: 8)
-            Text(model.connected ? "MacBook 已在线 · 随时响应" : "等待连接至中继...")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Text("\(chatStore.projects.count) 个项目 · \(chatStore.sessions.count) 个对话")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
+    private var projectsListView: some View {
+        List {
+            ForEach(chatStore.projects) { project in
+                NavigationLink(value: project) {
+                    ProjectRowView(project: project)
+                }
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    if project.id != "outside-of-project" && project.id != "default-cli-project" {
+                        Button(role: .destructive) {
+                            projectToDelete = project
+                        } label: {
+                            Label("删除项目", systemImage: "trash")
+                        }
+                    }
+                }
+            }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 7)
-        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .listStyle(.plain)
+        .refreshable {
+            await chatStore.sync(server: model.server, token: token)
+        }
+    }
+
+    private var searchResultsListView: some View {
+        List {
+            if !matchingProjects.isEmpty {
+                Section {
+                    ForEach(matchingProjects) { project in
+                        NavigationLink(value: project) {
+                            ProjectRowView(project: project)
+                        }
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    }
+                } header: {
+                    Text("项目 (\(matchingProjects.count))")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if !matchingSessions.isEmpty {
+                Section {
+                    ForEach(matchingSessions) { session in
+                        NavigationLink(value: session) {
+                            TopicRowView(
+                                session: session,
+                                isTyping: chatStore.isAgentTyping(for: session.id),
+                                highlightQuery: searchTrimmed
+                            )
+                        }
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    }
+                } header: {
+                    Text("对话 (\(matchingSessions.count))")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if !matchingMessages.isEmpty {
+                Section {
+                    ForEach(matchingMessages) { item in
+                        NavigationLink(value: item.session) {
+                            HStack(spacing: 12) {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                        .fill(topicGradient(for: item.session.id))
+                                        .frame(width: 44, height: 44)
+                                    Text(item.session.icon.isEmpty ? "💬" : item.session.icon)
+                                        .font(.system(size: 20))
+                                }
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text(item.session.title)
+                                            .font(.system(size: 15, weight: .semibold))
+                                            .foregroundStyle(Color.primary)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Text(formatRelativeTime(item.message.createdAt))
+                                            .font(.system(size: 11))
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    HStack(spacing: 4) {
+                                        Text(item.session.projectName)
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundStyle(Color.accentColor)
+                                            .lineLimit(1)
+                                        Text("•")
+                                            .font(.system(size: 10))
+                                            .foregroundStyle(.secondary)
+                                        Text(item.message.sender == "user" ? "我:" : "Agent:")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(.secondary)
+                                        Text(item.snippet)
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(Color.primary.opacity(0.85))
+                                            .lineLimit(2)
+                                    }
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
+                    }
+                } header: {
+                    Text("消息记录 (\(matchingMessages.count))")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
     }
 
     private var emptySearchResultView: some View {
         VStack(spacing: 12) {
             Spacer()
             Image(systemName: "magnifyingglass")
-                .font(.system(size: 40))
+                .font(.system(size: 44))
                 .foregroundStyle(.tertiary)
-            Text("未找到相关项目")
+            Text("未找到相关内容")
                 .font(.headline)
                 .foregroundStyle(.secondary)
-            Text("没有找到与“\(searchText)”匹配的项目或对话")
+            Text("本地没有找到包含“\(searchText)”的项目、对话或消息")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
@@ -379,109 +593,116 @@ struct ProjectTopicsListView: View {
         return nil
     }
 
-    private var projectSessions: [ChatSessionItem] {
-        let baseList = chatStore.sessions.filter { $0.projectId == project.id }
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
-        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if query.isEmpty {
+    private var searchTrimmed: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var projectSessions: [ChatSessionItem] {
+        let baseList = chatStore.sessions.filter { s in
+            if project.id == "outside-of-project" {
+                return s.projectId == "outside-of-project" || s.projectId.isEmpty || s.projectId == "default" || s.projectName == "Outside of Project"
+            }
+            return s.projectId == project.id || (s.projectName == project.name && !project.name.isEmpty)
+        }
+
+        guard isSearching else {
             return baseList
         }
+        let query = searchTrimmed
         return baseList.filter { s in
-            s.title.lowercased().contains(query) ||
-            s.lastMessageSnippet.lowercased().contains(query)
+            s.title.localizedCaseInsensitiveContains(query) ||
+            s.lastMessageSnippet.localizedCaseInsensitiveContains(query) ||
+            chatStore.messages(for: s.id).contains { $0.content.localizedCaseInsensitiveContains(query) }
         }
     }
 
     var body: some View {
         ZStack {
-            VStack(spacing: 0) {
-                // Topic count indicator bar
-                HStack(spacing: 6) {
-                    Text(project.icon)
-                        .font(.caption)
-                    Text(project.name)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary)
-                    Spacer()
-                    Text("共 \(projectSessions.count) 个对话")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(Color(uiColor: .secondarySystemGroupedBackground))
-
-                if projectSessions.isEmpty {
-                    emptyTopicsView
+            if projectSessions.isEmpty {
+                if isSearching {
+                    emptySearchResultView
                 } else {
-                    List {
-                        ForEach(projectSessions) { session in
-                            NavigationLink(value: session) {
-                                TopicRowView(
-                                    session: session,
-                                    isTyping: chatStore.isAgentTyping(for: session.id)
-                                )
-                            }
-                            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                Button(role: .destructive) {
-                                    sessionToDelete = session
-                                } label: {
-                                    Label("删除", systemImage: "trash")
-                                }
-                            }
-                            .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                                Button {
-                                    withAnimation {
-                                        chatStore.togglePin(id: session.id)
-                                    }
-                                } label: {
-                                    Label(
-                                        session.isPinned ? "取消置顶" : "置顶",
-                                        systemImage: session.isPinned ? "pin.slash.fill" : "pin.fill"
-                                    )
-                                }
-                                .tint(.blue)
-                            }
-                            .contextMenu {
-                                Button {
-                                    withAnimation {
-                                        chatStore.togglePin(id: session.id)
-                                    }
-                                } label: {
-                                    Label(
-                                        session.isPinned ? "取消置顶" : "置顶",
-                                        systemImage: session.isPinned ? "pin.slash" : "pin"
-                                    )
-                                }
-
-                                Button {
-                                    renameText = session.title
-                                    sessionToRename = session
-                                } label: {
-                                    Label("重命名", systemImage: "pencil")
-                                }
-
-                                Button {
-                                    chatStore.clearHistory(sessionId: session.id)
-                                } label: {
-                                    Label("清空记录", systemImage: "paintbrush")
-                                }
-
-                                Divider()
-
-                                Button(role: .destructive) {
-                                    sessionToDelete = session
-                                } label: {
-                                    Label("删除对话", systemImage: "trash")
-                                }
-                            }
-                        }
+                    ScrollView {
+                        emptyTopicsView
+                            .frame(maxWidth: .infinity, minHeight: 400)
                     }
-                    .listStyle(.plain)
                     .refreshable {
                         await chatStore.sync(server: model.server, token: token)
                     }
+                }
+            } else {
+                List {
+                    ForEach(projectSessions) { session in
+                        NavigationLink(value: session) {
+                            TopicRowView(
+                                session: session,
+                                isTyping: chatStore.isAgentTyping(for: session.id),
+                                highlightQuery: isSearching ? searchTrimmed : nil
+                            )
+                        }
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                sessionToDelete = session
+                            } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                        }
+                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                            Button {
+                                withAnimation {
+                                    chatStore.togglePin(id: session.id)
+                                }
+                            } label: {
+                                Label(
+                                    session.isPinned ? "取消置顶" : "置顶",
+                                    systemImage: session.isPinned ? "pin.slash.fill" : "pin.fill"
+                                )
+                            }
+                            .tint(.blue)
+                        }
+                        .contextMenu {
+                            Button {
+                                withAnimation {
+                                    chatStore.togglePin(id: session.id)
+                                }
+                            } label: {
+                                Label(
+                                    session.isPinned ? "取消置顶" : "置顶",
+                                    systemImage: session.isPinned ? "pin.slash" : "pin"
+                                )
+                            }
+
+                            Button {
+                                renameText = session.title
+                                sessionToRename = session
+                            } label: {
+                                Label("重命名", systemImage: "pencil")
+                            }
+
+                            Button {
+                                chatStore.clearHistory(sessionId: session.id)
+                            } label: {
+                                Label("清空记录", systemImage: "paintbrush")
+                            }
+
+                            Divider()
+
+                            Button(role: .destructive) {
+                                sessionToDelete = session
+                            } label: {
+                                Label("删除对话", systemImage: "trash")
+                            }
+                        }
+                    }
+                }
+                .listStyle(.plain)
+                .refreshable {
+                    await chatStore.sync(server: model.server, token: token)
                 }
             }
 
@@ -515,6 +736,17 @@ struct ProjectTopicsListView: View {
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $searchText, prompt: "搜索当前项目对话")
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                VStack(spacing: 2) {
+                    Text(project.name)
+                        .font(.system(size: 16, weight: .bold))
+                        .lineLimit(1)
+                    Text("共 \(projectSessions.count) 个对话")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             ToolbarItem(placement: .navigationBarTrailing) {
                 Button {
                     let newTopic = chatStore.createSession(
@@ -555,6 +787,13 @@ struct ProjectTopicsListView: View {
             }
         } message: {
             Text("确定要删除此对话及其所有聊天记录吗？此操作不可撤销。")
+        }
+        .onAppear {
+            if projectSessions.isEmpty {
+                Task {
+                    await chatStore.sync(server: model.server, token: token)
+                }
+            }
         }
     }
 
@@ -599,6 +838,24 @@ struct ProjectTopicsListView: View {
             Spacer()
         }
     }
+
+    private var emptySearchResultView: some View {
+        VStack(spacing: 12) {
+            Spacer()
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 44))
+                .foregroundStyle(.tertiary)
+            Text("未找到相关对话")
+                .font(.headline)
+                .foregroundStyle(.secondary)
+            Text("当前项目中未找到包含“\(searchText)”的对话或消息")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            Spacer()
+        }
+    }
 }
 
 // MARK: - Topic Row View (Telegram Topic Item with Badge)
@@ -606,6 +863,17 @@ struct ProjectTopicsListView: View {
 struct TopicRowView: View {
     let session: ChatSessionItem
     let isTyping: Bool
+    var highlightQuery: String? = nil
+
+    private var displaySnippet: String {
+        if let q = highlightQuery?.trimmingCharacters(in: .whitespacesAndNewlines), !q.isEmpty {
+            if let matched = MobileChatStore.shared.messages(for: session.id).reversed().first(where: { $0.content.localizedCaseInsensitiveContains(q) }) {
+                let snip = makeSnippet(content: matched.content, query: q)
+                return "\(matched.sender == "user" ? "我" : "Agent"): \(snip)"
+            }
+        }
+        return session.lastMessageSnippet
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -644,10 +912,10 @@ struct TopicRowView: View {
                                 .font(.system(size: 13))
                                 .foregroundStyle(Color.accentColor)
                         }
-                    } else if !session.lastMessageSnippet.isEmpty {
-                        Text(session.lastMessageSnippet)
+                    } else if !displaySnippet.isEmpty {
+                        Text(displaySnippet)
                             .font(.system(size: 13))
-                            .foregroundStyle(Color.secondary)
+                            .foregroundStyle(highlightQuery != nil ? Color.primary.opacity(0.85) : Color.secondary)
                             .lineLimit(2)
                     } else {
                         Text("暂无消息")
@@ -679,19 +947,33 @@ struct TopicRowView: View {
         }
         .padding(.vertical, 4)
     }
+}
 
-    private func topicGradient(for id: String) -> LinearGradient {
-        let colors: [[Color]] = [
-            [Color(red: 0.15, green: 0.50, blue: 0.90), Color(red: 0.10, green: 0.35, blue: 0.80)],
-            [Color(red: 0.45, green: 0.30, blue: 0.85), Color(red: 0.60, green: 0.20, blue: 0.80)],
-            [Color(red: 0.12, green: 0.70, blue: 0.65), Color(red: 0.08, green: 0.50, blue: 0.55)],
-            [Color(red: 0.95, green: 0.50, blue: 0.15), Color(red: 0.90, green: 0.30, blue: 0.25)],
-            [Color(red: 0.20, green: 0.70, blue: 0.35), Color(red: 0.12, green: 0.55, blue: 0.40)],
-        ]
-        let hash = abs(id.hashValue)
-        let pair = colors[hash % colors.count]
-        return LinearGradient(colors: pair, startPoint: .topLeading, endPoint: .bottomTrailing)
+// MARK: - Search & Style Helpers
+
+func topicGradient(for id: String) -> LinearGradient {
+    let colors: [[Color]] = [
+        [Color(red: 0.15, green: 0.50, blue: 0.90), Color(red: 0.10, green: 0.35, blue: 0.80)],
+        [Color(red: 0.45, green: 0.30, blue: 0.85), Color(red: 0.60, green: 0.20, blue: 0.80)],
+        [Color(red: 0.12, green: 0.70, blue: 0.65), Color(red: 0.08, green: 0.50, blue: 0.55)],
+        [Color(red: 0.95, green: 0.50, blue: 0.15), Color(red: 0.90, green: 0.30, blue: 0.25)],
+        [Color(red: 0.20, green: 0.70, blue: 0.35), Color(red: 0.12, green: 0.55, blue: 0.40)],
+    ]
+    let hash = abs(id.hashValue)
+    let pair = colors[hash % colors.count]
+    return LinearGradient(colors: pair, startPoint: .topLeading, endPoint: .bottomTrailing)
+}
+
+func makeSnippet(content: String, query: String) -> String {
+    let clean = content.replacingOccurrences(of: "\n", with: " ")
+    guard let range = clean.range(of: query, options: .caseInsensitive) else {
+        return String(clean.prefix(80))
     }
+    let lowerIndex = clean.index(range.lowerBound, offsetBy: -20, limitedBy: clean.startIndex) ?? clean.startIndex
+    let upperIndex = clean.index(range.upperBound, offsetBy: 40, limitedBy: clean.endIndex) ?? clean.endIndex
+    let prefix = lowerIndex > clean.startIndex ? "..." : ""
+    let suffix = upperIndex < clean.endIndex ? "..." : ""
+    return prefix + clean[lowerIndex..<upperIndex].trimmingCharacters(in: .whitespaces) + suffix
 }
 
 // MARK: - Time Formatter Helper
@@ -725,15 +1007,33 @@ struct ChatDetailView: View {
     @State private var isShowingDeleteAlert: Bool = false
     @State private var isShowingRenameAlert: Bool = false
     @State private var renameText: String = ""
+    @State private var isSearching: Bool = false
+    @State private var searchKeyword: String = ""
     @FocusState private var isInputFocused: Bool
+    @State private var quotaNotificationScheduled: String? = nil
 
-    // Quick prompt shortcuts
-    private let quickPrompts = [
-        "📊 检查机器与 Git 状态",
-        "🧪 运行所有单元测试",
-        "🔍 查看最近系统日志",
-        "💡 总结今天完成的工作",
-    ]
+    private var detectedQuotaIssue: String? {
+        if let err = chatStore.errorMessage, isQuotaError(err) {
+            return err
+        }
+        if let lastAgentMsg = sessionMessages.last(where: { $0.sender != "user" }) {
+            if isQuotaError(lastAgentMsg.content) {
+                return lastAgentMsg.content
+            }
+        }
+        return nil
+    }
+
+    private func isQuotaError(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        return lower.contains("429") ||
+               lower.contains("rate limit") ||
+               lower.contains("quota") ||
+               lower.contains("resource_exhausted") ||
+               lower.contains("usage limit") ||
+               lower.contains("额度") ||
+               lower.contains("配额")
+    }
 
     private var token: String? {
         if let data = try? KeychainStore.load(),
@@ -751,21 +1051,43 @@ struct ChatDetailView: View {
         chatStore.messages(for: session.id)
     }
 
+    private var displayMessages: [ChatMessageItem] {
+        let kw = searchKeyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        if kw.isEmpty || !isSearching {
+            return sessionMessages
+        }
+        return sessionMessages.filter { $0.content.localizedCaseInsensitiveContains(kw) }
+    }
+
     private var isAgentTyping: Bool {
         chatStore.isAgentTyping(for: session.id)
     }
 
     var body: some View {
         VStack(spacing: 0) {
+            if isSearching {
+                inChatSearchBar
+            }
+
             // Messages list
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 12) {
-                        if sessionMessages.isEmpty {
+                        if isSearching && !searchKeyword.isEmpty && displayMessages.isEmpty {
+                            VStack(spacing: 10) {
+                                Image(systemName: "magnifyingglass")
+                                    .font(.system(size: 36))
+                                    .foregroundStyle(.tertiary)
+                                Text("未找到包含“\(searchKeyword)”的消息")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.top, 50)
+                        } else if sessionMessages.isEmpty {
                             emptyStateView
                                 .padding(.top, 40)
                         } else {
-                            ForEach(sessionMessages) { message in
+                            ForEach(displayMessages) { message in
                                 MessageBubbleView(message: message, onRetry: {
                                     Task {
                                         await chatStore.retryMessage(
@@ -783,26 +1105,25 @@ struct ChatDetailView: View {
                         // Typing / Thinking Indicator
                         if isAgentTyping {
                             HStack(spacing: 8) {
-                                AgentAvatarView()
                                 TypingDotsIndicatorView()
                                 Spacer()
                             }
-                            .padding(.horizontal, 16)
+                            .padding(.horizontal, 10)
                             .id("typing_indicator")
                         }
                     }
                     .padding(.vertical, 14)
                 }
+                .defaultScrollAnchor(.bottom)
                 .background(Color(uiColor: .systemGroupedBackground))
                 .onTapGesture {
                     isInputFocused = false
                 }
+                .onAppear {
+                    scrollToBottom(proxy: proxy, animated: false)
+                }
                 .onChange(of: sessionMessages.count) { _ in
-                    withAnimation(.easeOut(duration: 0.25)) {
-                        if let lastId = sessionMessages.last?.id {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
-                    }
+                    scrollToBottom(proxy: proxy, animated: true)
                 }
                 .onChange(of: isAgentTyping) { typing in
                     if typing {
@@ -830,6 +1151,64 @@ struct ChatDetailView: View {
                 .background(Color(uiColor: .secondarySystemBackground))
             }
 
+            // Quota limit smart banner
+            if detectedQuotaIssue != nil {
+                HStack(spacing: 8) {
+                    Image(systemName: "hourglass.circle.fill")
+                        .foregroundStyle(.orange)
+                    Text("检测到 Agent 额度受限")
+                        .font(.system(size: 12, weight: .semibold))
+                    Spacer()
+                    Button("5h 提醒") {
+                        Task {
+                            let acct = model.activeIdentity?.name ?? "antigravity-0"
+                            await QuotaResetStore.shared.scheduleReminder(account: acct, type: .fiveHours)
+                            withAnimation {
+                                quotaNotificationScheduled = "已为 \(acct) 设定 5h 额度重置提醒"
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .font(.system(size: 11, weight: .semibold))
+                    .tint(.blue)
+
+                    Button("1周 提醒") {
+                        Task {
+                            let acct = model.activeIdentity?.name ?? "antigravity-0"
+                            await QuotaResetStore.shared.scheduleReminder(account: acct, type: .oneWeek)
+                            withAnimation {
+                                quotaNotificationScheduled = "已为 \(acct) 设定 1周 额度重置提醒"
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .font(.system(size: 11, weight: .semibold))
+                    .tint(.purple)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.12))
+            }
+
+            if let scheduled = quotaNotificationScheduled {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text(scheduled)
+                        .font(.system(size: 11))
+                    Spacer()
+                    Button("关闭") {
+                        withAnimation {
+                            quotaNotificationScheduled = nil
+                        }
+                    }
+                    .font(.system(size: 11))
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 4)
+                .background(Color.green.opacity(0.12))
+            }
+
             // Bottom Input Bar
             bottomInputBar
         }
@@ -853,41 +1232,55 @@ struct ChatDetailView: View {
             }
 
             ToolbarItem(placement: .navigationBarTrailing) {
-                Menu {
+                HStack(spacing: 12) {
                     Button {
-                        renameText = currentSession.title
-                        isShowingRenameAlert = true
-                    } label: {
-                        Label("重命名会话", systemImage: "pencil")
-                    }
-
-                    Button {
-                        withAnimation {
-                            chatStore.togglePin(id: session.id)
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            isSearching.toggle()
+                            if !isSearching {
+                                searchKeyword = ""
+                            }
                         }
                     } label: {
-                        Label(
-                            currentSession.isPinned ? "取消置顶" : "置顶会话",
-                            systemImage: currentSession.isPinned ? "pin.slash" : "pin"
-                        )
+                        Image(systemName: isSearching ? "magnifyingglass.circle.fill" : "magnifyingglass")
+                            .font(.system(size: 16))
                     }
 
-                    Button(role: .destructive) {
-                        isShowingClearAlert = true
+                    Menu {
+                        Button {
+                            renameText = currentSession.title
+                            isShowingRenameAlert = true
+                        } label: {
+                            Label("重命名会话", systemImage: "pencil")
+                        }
+
+                        Button {
+                            withAnimation {
+                                chatStore.togglePin(id: session.id)
+                            }
+                        } label: {
+                            Label(
+                                currentSession.isPinned ? "取消置顶" : "置顶会话",
+                                systemImage: currentSession.isPinned ? "pin.slash" : "pin"
+                            )
+                        }
+
+                        Button(role: .destructive) {
+                            isShowingClearAlert = true
+                        } label: {
+                            Label("清空聊天记录", systemImage: "paintbrush")
+                        }
+
+                        Divider()
+
+                        Button(role: .destructive) {
+                            isShowingDeleteAlert = true
+                        } label: {
+                            Label("删除此会话", systemImage: "trash")
+                        }
                     } label: {
-                        Label("清空聊天记录", systemImage: "paintbrush")
+                        Image(systemName: "ellipsis.circle")
+                            .font(.body)
                     }
-
-                    Divider()
-
-                    Button(role: .destructive) {
-                        isShowingDeleteAlert = true
-                    } label: {
-                        Label("删除此会话", systemImage: "trash")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .font(.body)
                 }
             }
         }
@@ -917,7 +1310,69 @@ struct ChatDetailView: View {
         }
         .onAppear {
             chatStore.selectedSessionId = session.id
+            Task {
+                await chatStore.sync(server: model.server, token: token)
+            }
         }
+        .refreshable {
+            await chatStore.sync(server: model.server, token: token)
+        }
+    }
+
+    private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+        guard let lastId = displayMessages.last?.id else { return }
+        if animated {
+            withAnimation(.easeOut(duration: 0.25)) {
+                proxy.scrollTo(lastId, anchor: .bottom)
+            }
+        } else {
+            proxy.scrollTo(lastId, anchor: .bottom)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                proxy.scrollTo(lastId, anchor: .bottom)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                proxy.scrollTo(lastId, anchor: .bottom)
+            }
+        }
+    }
+
+    // In-chat search bar
+    private var inChatSearchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .font(.system(size: 14))
+
+            TextField("搜索此会话内容...", text: $searchKeyword)
+                .font(.system(size: 14))
+                .textFieldStyle(.plain)
+
+            if !searchKeyword.isEmpty {
+                Button {
+                    searchKeyword = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Button("取消") {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isSearching = false
+                    searchKeyword = ""
+                }
+            }
+            .font(.system(size: 14))
+            .foregroundStyle(Color.accentColor)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color(uiColor: .secondarySystemBackground))
+        .overlay(
+            Divider(),
+            alignment: .bottom
+        )
     }
 
     // Empty state
@@ -938,98 +1393,44 @@ struct ChatDetailView: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 32)
-
-            // Quick suggestion chips
-            VStack(alignment: .leading, spacing: 8) {
-                Text("快捷示例：")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                ForEach(quickPrompts, id: \.self) { prompt in
-                    Button {
-                        inputText = prompt
-                        isInputFocused = true
-                    } label: {
-                        HStack {
-                            Text(prompt)
-                                .font(.footnote)
-                            Spacer()
-                            Image(systemName: "arrow.up.right")
-                                .font(.caption2)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(Color(uiColor: .secondarySystemGroupedBackground))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.top, 8)
         }
     }
 
     // Telegram/QQ-style bottom floating input dock
     private var bottomInputBar: some View {
-        VStack(spacing: 8) {
-            if !quickPrompts.isEmpty && inputText.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(quickPrompts, id: \.self) { chip in
-                            Button {
-                                inputText = chip
-                                isInputFocused = true
-                            } label: {
-                                Text(chip)
-                                    .font(.caption)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(Color(uiColor: .tertiarySystemFill))
-                                    .clipShape(Capsule())
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                }
-            }
+        HStack(alignment: .bottom, spacing: 10) {
+            TextField("给 Agent 发送指令...", text: $inputText, axis: .vertical)
+                .lineLimit(1...5)
+                .focused($isInputFocused)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color(uiColor: .tertiarySystemFill))
+                .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
 
-            HStack(alignment: .bottom, spacing: 10) {
-                TextField("给 Agent 发送指令...", text: $inputText, axis: .vertical)
-                    .lineLimit(1...5)
-                    .focused($isInputFocused)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(Color(uiColor: .tertiarySystemFill))
-                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-
-                Button {
-                    let text = inputText
-                    inputText = ""
-                    Task {
-                        await chatStore.sendMessage(
-                            content: text,
-                            sessionId: session.id,
-                            server: model.server,
-                            token: token
-                        )
-                    }
-                } label: {
-                    Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 32))
-                        .foregroundStyle(
-                            inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                ? Color.secondary.opacity(0.4)
-                                : Color.accentColor
-                        )
+            Button {
+                let text = inputText
+                inputText = ""
+                Task {
+                    await chatStore.sendMessage(
+                        content: text,
+                        sessionId: session.id,
+                        server: model.server,
+                        token: token
+                    )
                 }
-                .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            } label: {
+                Image(systemName: "arrow.up.circle.fill")
+                    .font(.system(size: 32))
+                    .foregroundStyle(
+                        inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? Color.secondary.opacity(0.4)
+                            : Color.accentColor
+                    )
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .disabled(inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
         .background(
             Color(uiColor: .secondarySystemGroupedBackground)
                 .ignoresSafeArea(edges: .bottom)
@@ -1048,14 +1449,12 @@ struct MessageBubbleView: View {
     }
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 8) {
+        HStack(alignment: .bottom, spacing: 0) {
             if isUser {
-                Spacer(minLength: 44)
-            } else {
-                AgentAvatarView()
+                Spacer(minLength: 28)
             }
 
-            VStack(alignment: isUser ? .trailing : .leading, spacing: 4) {
+            VStack(alignment: isUser ? .trailing : .leading, spacing: 3) {
                 // Tool invocation / Thought badge if applicable
                 if let toolName = message.toolName {
                     HStack(spacing: 4) {
@@ -1091,11 +1490,20 @@ struct MessageBubbleView: View {
                 .clipShape(BubbleShape(isUser: isUser))
                 .shadow(color: Color.black.opacity(0.04), radius: 2, x: 0, y: 1)
 
-                // Timestamp and Delivery Status
-                HStack(spacing: 4) {
+                // Timestamp, Latency & Delivery Status
+                HStack(spacing: 5) {
                     Text(timeString(from: message.createdAt))
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
+
+                    if !isUser, let duration = message.duration, duration > 0 {
+                        Text("·")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                        Text(formatDuration(duration))
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                    }
 
                     if isUser {
                         statusIcon
@@ -1105,10 +1513,10 @@ struct MessageBubbleView: View {
             }
 
             if !isUser {
-                Spacer(minLength: 44)
+                Spacer(minLength: 12)
             }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 8)
     }
 
     @ViewBuilder
@@ -1166,6 +1574,16 @@ struct MessageBubbleView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
         return formatter.string(from: date)
+    }
+
+    private func formatDuration(_ seconds: Double) -> String {
+        if seconds < 60.0 {
+            return String(format: "耗时 %.1fs", seconds)
+        } else {
+            let m = Int(seconds) / 60
+            let s = Int(seconds) % 60
+            return "耗时 \(m)m \(s)s"
+        }
     }
 }
 

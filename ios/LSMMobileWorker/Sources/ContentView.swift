@@ -6,7 +6,7 @@ struct ContentView: View {
     @ObservedObject private var approvals = ApprovalPromptCoordinator.shared
     @ObservedObject private var scanner = CodeScannerCoordinator.shared
     @ObservedObject private var inbox = MobileInboxStore.shared
-    @ObservedObject private var events = MobileEventStore.shared
+    @ObservedObject private var quotaStore = QuotaResetStore.shared
     @State private var showSettings = false
 
     var body: some View {
@@ -43,12 +43,12 @@ struct ContentView: View {
             .badge(inbox.items.filter { !$0.read }.count)
 
             NavigationStack {
-                ControllerEventsView()
+                QuotaResetView(model: model)
             }
             .tabItem {
-                Label("Events", systemImage: "bell.badge")
+                Label("额度", systemImage: "hourglass.badge.plus")
             }
-            .badge(events.items.count)
+            .badge(quotaStore.activeReminders.count)
         }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
@@ -91,6 +91,7 @@ private struct WorkerHomeView: View {
     @ObservedObject var model: WorkerViewModel
     @ObservedObject var scanner: CodeScannerCoordinator
     @Binding var showSettings: Bool
+    @State private var showAccountSwitcher: Bool = false
 
     var body: some View {
         List {
@@ -100,8 +101,15 @@ private struct WorkerHomeView: View {
                         .fill(statusColor)
                         .frame(width: 10, height: 10)
 
-                    Text(model.status)
-                        .fontWeight(.medium)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(model.status)
+                            .fontWeight(.medium)
+                        if let active = model.activeIdentity {
+                            Text("\(active.name) · \(active.displayServer)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
 
                     Spacer()
 
@@ -115,6 +123,23 @@ private struct WorkerHomeView: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
                     .disabled(!model.connected && !canConnect)
+                }
+
+                Button {
+                    showAccountSwitcher = true
+                } label: {
+                    HStack {
+                        Label("切换账号", systemImage: "person.2.circle")
+                        Spacer()
+                        if model.accounts.count > 1 {
+                            Text("\(model.accounts.count) 个账号")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
                 }
             }
 
@@ -158,6 +183,9 @@ private struct WorkerHomeView: View {
             }
         }
         .navigationTitle("LSM Worker")
+        .sheet(isPresented: $showAccountSwitcher) {
+            AccountSwitcherView(model: model)
+        }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -194,9 +222,60 @@ private struct WorkerSettingsView: View {
     @State private var showFilePicker = false
     @State private var showDirectoryPicker = false
     @State private var fileAccessMessage = ""
+    @State private var showAddAccountSheet = false
 
     var body: some View {
         Form {
+            Section("Accounts / 账号管理") {
+                ForEach(model.accounts) { account in
+                    let isActive = (account.name.lowercased() == (model.activeIdentity?.name ?? model.workerName).lowercased())
+                    Button {
+                        if !isActive {
+                            model.switchToAccount(account)
+                        }
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 6) {
+                                    Text(account.name)
+                                        .font(.body)
+                                        .foregroundStyle(Color.primary)
+                                    if isActive {
+                                        Text("当前")
+                                            .font(.system(size: 11, weight: .bold))
+                                            .foregroundStyle(Color.accentColor)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.accentColor.opacity(0.12))
+                                            .clipShape(Capsule())
+                                    }
+                                }
+                                Text(account.server)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if isActive {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(Color.accentColor)
+                                    .font(.subheadline.bold())
+                            }
+                        }
+                    }
+                }
+                .onDelete { indexSet in
+                    for idx in indexSet {
+                        model.removeAccount(model.accounts[idx])
+                    }
+                }
+
+                Button {
+                    showAddAccountSheet = true
+                } label: {
+                    Label("添加新账号", systemImage: "plus.circle")
+                }
+            }
+
             Section("Connection") {
                 TextField("Controller", text: $model.server)
                     .textInputAutocapitalization(.never)
@@ -327,6 +406,9 @@ private struct WorkerSettingsView: View {
                 Button("Done") { dismiss() }
             }
         }
+        .sheet(isPresented: $showAddAccountSheet) {
+            AddAccountSheet(model: model)
+        }
         .fileImporter(
             isPresented: $showFilePicker,
             allowedContentTypes: [.item],
@@ -360,6 +442,343 @@ private struct WorkerSettingsView: View {
             Text(detail)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Multi-Account Management Views
+
+struct AccountSwitcherView: View {
+    @ObservedObject var model: WorkerViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var showAddSheet = false
+    @State private var accountToDelete: WorkerIdentity? = nil
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(model.accounts) { account in
+                        let isActive = (account.name.lowercased() == (model.activeIdentity?.name ?? model.workerName).lowercased())
+                        Button {
+                            if !isActive {
+                                model.switchToAccount(account)
+                            }
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 14) {
+                                ZStack {
+                                    Circle()
+                                        .fill(isActive ? Color.accentColor.opacity(0.15) : Color(uiColor: .tertiarySystemFill))
+                                        .frame(width: 44, height: 44)
+                                    Image(systemName: account.agentIcon)
+                                        .font(.system(size: 20))
+                                        .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
+                                }
+
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 6) {
+                                        Text(account.agentDisplayName)
+                                            .font(.system(size: 16, weight: .semibold))
+                                            .foregroundStyle(Color.primary)
+                                        if isActive {
+                                            Text("当前")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundStyle(Color.accentColor)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.accentColor.opacity(0.12))
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+
+                                    HStack(spacing: 6) {
+                                        Circle()
+                                            .fill(isActive && model.connected ? Color.green : (isActive ? Color.orange : Color.secondary.opacity(0.4)))
+                                            .frame(width: 6, height: 6)
+                                        Text(account.server)
+                                            .font(.system(size: 13))
+                                            .foregroundStyle(Color.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+
+                                Spacer()
+
+                                if isActive {
+                                    Image(systemName: "checkmark")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                accountToDelete = account
+                            } label: {
+                                Label("删除", systemImage: "trash")
+                            }
+                        }
+                    }
+                } header: {
+                    Text("已配置的 Agent 账号")
+                } footer: {
+                    Text("点击任意账号即可无缝切换连接并同步对应的历史记录与对话数据。左滑可删除历史账号。")
+                }
+
+                Section {
+                    Button {
+                        model.addOrSwitchProfile(name: "antigravity-0")
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "atom")
+                                .font(.system(size: 18))
+                                .foregroundStyle(Color.purple)
+                                .frame(width: 28)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("antigravity-0")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(Color.primary)
+                                Text("MacBook 原版默认环境 (~/.gemini)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "arrow.right.circle")
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+
+                    Button {
+                        model.addOrSwitchProfile(name: "antigravity-1")
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "atom")
+                                .font(.system(size: 18))
+                                .foregroundStyle(Color.blue)
+                                .frame(width: 28)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("antigravity-1")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(Color.primary)
+                                Text("MacBook Personal 隔离环境 (~/.antigravity-personal)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "arrow.right.circle")
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+
+                    Button {
+                        model.addOrSwitchProfile(name: "codex-1")
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "chevron.left.forwardslash.chevron.right")
+                                .font(.system(size: 16))
+                                .foregroundStyle(Color.green)
+                                .frame(width: 28)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("codex-1")
+                                    .font(.system(size: 15, weight: .medium))
+                                    .foregroundStyle(Color.primary)
+                                Text("Codex Agent 环境")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Image(systemName: "arrow.right.circle")
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                } header: {
+                    Text("快捷切换 / 添加 Agent 账号")
+                } footer: {
+                    Text("在同级直接切换不同 Agent 与账号（antigravity-0 / antigravity-1 / codex），聊天历史完全隔离存储。")
+                }
+
+                Section {
+                    Button {
+                        showAddSheet = true
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.system(size: 20))
+                                .foregroundStyle(Color.accentColor)
+                            Text("添加新控制器 / 服务器...")
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundStyle(Color.accentColor)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+            .navigationTitle("切换账号")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        showAddSheet = true
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 16, weight: .semibold))
+                    }
+                }
+            }
+            .onAppear {
+                model.reloadAccounts()
+                Task {
+                    await MobileChatStore.shared.fetchProjectConversations(server: model.server, token: model.activeIdentity?.token)
+                }
+            }
+            .sheet(isPresented: $showAddSheet) {
+                AddAccountSheet(model: model)
+            }
+            .alert("删除账号", isPresented: Binding(
+                get: { accountToDelete != nil },
+                set: { if !$0 { accountToDelete = nil } }
+            )) {
+                Button("取消", role: .cancel) { accountToDelete = nil }
+                Button("删除", role: .destructive) {
+                    if let acc = accountToDelete {
+                        model.removeAccount(acc)
+                    }
+                    accountToDelete = nil
+                }
+            } message: {
+                Text("确定要删除此账号吗？此设备的配对密钥将从 Keychain 移除。")
+            }
+        }
+    }
+}
+
+struct AddAccountSheet: View {
+    @ObservedObject var model: WorkerViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var server: String = "https://mcp.xycdev.com"
+    @State private var workerName: String = "morrow-iphone"
+    @State private var invite: String = ""
+    @State private var isPairing: Bool = false
+    @State private var errorMessage: String? = nil
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("https://...", text: $server)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                } header: {
+                    Text("控制器地址 (Controller URL)")
+                } footer: {
+                    Text("输入运行 LSM 控制器的中继或 Mac 本地服务地址。")
+                }
+
+                Section {
+                    TextField("设备 / 账号名称", text: $workerName)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    HStack(spacing: 8) {
+                        Button("antigravity-0") { workerName = "antigravity-0" }
+                            .buttonStyle(.bordered)
+                            .font(.caption)
+                        Button("antigravity-1") { workerName = "antigravity-1" }
+                            .buttonStyle(.bordered)
+                            .font(.caption)
+                        Button("codex-1") { workerName = "codex-1" }
+                            .buttonStyle(.bordered)
+                            .font(.caption)
+                    }
+                } header: {
+                    Text("本设备 / Agent 账号名称")
+                } footer: {
+                    Text("可快速选择填入常用 Agent 标识。")
+                }
+
+                Section {
+                    SecureField("输入配对邀请码", text: $invite)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                } header: {
+                    Text("配对邀请码 (Invite Code)")
+                } footer: {
+                    Text("在电脑端终端运行 LSM 生成邀请码后粘贴至此处。")
+                }
+
+                if let err = errorMessage {
+                    Section {
+                        Text(err)
+                            .font(.footnote)
+                            .foregroundStyle(Color.red)
+                    }
+                }
+
+                Section {
+                    Button {
+                        Task {
+                            await pair()
+                        }
+                    } label: {
+                        HStack {
+                            Spacer()
+                            if isPairing {
+                                ProgressView()
+                                    .padding(.trailing, 8)
+                                Text("正在配对并连接...")
+                                    .fontWeight(.semibold)
+                            } else {
+                                Text("配对并切换至此账号")
+                                    .fontWeight(.semibold)
+                            }
+                            Spacer()
+                        }
+                    }
+                    .disabled(isPairing || server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || invite.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .navigationTitle("添加账号")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") {
+                        dismiss()
+                    }
+                    .disabled(isPairing)
+                }
+            }
+        }
+    }
+
+    private func pair() async {
+        isPairing = true
+        errorMessage = nil
+        do {
+            try await model.pairNewAccount(
+                server: server,
+                invite: invite,
+                name: workerName
+            )
+            isPairing = false
+            dismiss()
+        } catch {
+            isPairing = false
+            errorMessage = error.localizedDescription
         }
     }
 }

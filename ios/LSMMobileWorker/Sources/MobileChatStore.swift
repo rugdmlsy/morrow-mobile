@@ -34,6 +34,7 @@ struct ChatProjectItem: Identifiable, Codable, Equatable, Hashable {
     static func == (lhs: ChatProjectItem, rhs: ChatProjectItem) -> Bool {
         lhs.id == rhs.id &&
         lhs.name == rhs.name &&
+        lhs.icon == rhs.icon &&
         lhs.count == rhs.count &&
         lhs.latestSnippet == rhs.latestSnippet
     }
@@ -156,6 +157,8 @@ struct ChatMessageItem: Identifiable, Codable, Equatable {
     let toolName: String?
     let toolOutput: String?
     let createdAt: Date
+    var tokens: Int?
+    var duration: Double?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -168,6 +171,10 @@ struct ChatMessageItem: Identifiable, Codable, Equatable {
         case content
         case toolInfo = "tool_info"
         case createdAt = "created_at"
+        case tokens
+        case tokenCount = "token_count"
+        case duration
+        case elapsedSeconds = "elapsed_seconds"
     }
 
     init(
@@ -181,7 +188,9 @@ struct ChatMessageItem: Identifiable, Codable, Equatable {
         content: String = "",
         toolName: String? = nil,
         toolOutput: String? = nil,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        tokens: Int? = nil,
+        duration: Double? = nil
     ) {
         self.id = id
         self.sessionId = sessionId
@@ -194,6 +203,8 @@ struct ChatMessageItem: Identifiable, Codable, Equatable {
         self.toolName = toolName
         self.toolOutput = toolOutput
         self.createdAt = createdAt
+        self.tokens = tokens
+        self.duration = duration
     }
 
     init(from decoder: Decoder) throws {
@@ -224,6 +235,11 @@ struct ChatMessageItem: Identifiable, Codable, Equatable {
             toolName = nil
             toolOutput = nil
         }
+
+        tokens = (try? container.decodeIfPresent(Int.self, forKey: .tokens))
+            ?? (try? container.decodeIfPresent(Int.self, forKey: .tokenCount))
+        duration = (try? container.decodeIfPresent(Double.self, forKey: .duration))
+            ?? (try? container.decodeIfPresent(Double.self, forKey: .elapsedSeconds))
     }
 
     func encode(to encoder: Encoder) throws {
@@ -237,11 +253,20 @@ struct ChatMessageItem: Identifiable, Codable, Equatable {
         try container.encode(status, forKey: .status)
         try container.encode(content, forKey: .content)
         try container.encode(createdAt.timeIntervalSince1970, forKey: .createdAt)
+        try container.encodeIfPresent(tokens, forKey: .tokens)
+        try container.encodeIfPresent(duration, forKey: .duration)
         if let name = toolName {
             var info: [String: String] = ["name": name]
             if let output = toolOutput { info["output"] = output }
             try container.encode(info, forKey: .toolInfo)
         }
+    }
+
+    var displayDuration: Double? {
+        if let duration = duration, duration > 0 {
+            return duration
+        }
+        return nil
     }
 }
 
@@ -268,21 +293,122 @@ final class MobileChatStore: ObservableObject {
         typingBySession[selectedSessionId] ?? false
     }
 
-    private let chatDir: URL
-    private let sessionsURL: URL
-    private let projectsURL: URL
+    @Published var currentAccount: String = "antigravity-0"
+
+    private let baseChatDir: URL
+    private var currentAccountKey: String = "default"
+    private var chatDir: URL {
+        baseChatDir.appendingPathComponent(currentAccountKey, isDirectory: true)
+    }
+    private var sessionsURL: URL {
+        chatDir.appendingPathComponent("sessions.json")
+    }
+    private var projectsURL: URL {
+        chatDir.appendingPathComponent("projects.json")
+    }
     private let legacyFileURL: URL
     private var syncTimer: AnyCancellable?
 
+    private static func accountKey(for accountName: String?, token: String?) -> String {
+        let name = (accountName ?? "").filter { $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }
+        if !name.isEmpty {
+            return name.lowercased()
+        }
+        guard let token, !token.isEmpty else { return "default" }
+        let clean = token.filter { $0.isLetter || $0.isNumber }
+        if clean.isEmpty { return "default" }
+        return "acc_\(clean.prefix(16).lowercased())"
+    }
+
     private init() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        self.chatDir = docs.appendingPathComponent("LSM/Chat", isDirectory: true)
+        self.baseChatDir = docs.appendingPathComponent("LSM/Chat", isDirectory: true)
+        try? FileManager.default.createDirectory(at: baseChatDir, withIntermediateDirectories: true)
+        self.legacyFileURL = baseChatDir.appendingPathComponent("chat_history.json")
+
+        if let data = try? KeychainStore.load(),
+           let id = try? JSONDecoder().decode(WorkerIdentity.self, from: data) {
+            let clean = (id.name.isEmpty || id.name == "morrow-iphone" || id.name == "default") ? "antigravity-0" : id.name
+            self.currentAccount = clean
+            self.currentAccountKey = Self.accountKey(for: clean, token: id.token)
+        } else {
+            self.currentAccount = "antigravity-0"
+            self.currentAccountKey = "antigravity-0"
+        }
         try? FileManager.default.createDirectory(at: chatDir, withIntermediateDirectories: true)
-        self.sessionsURL = chatDir.appendingPathComponent("sessions.json")
-        self.projectsURL = chatDir.appendingPathComponent("projects.json")
-        self.legacyFileURL = chatDir.appendingPathComponent("chat_history.json")
+        migrateLegacyChatFilesIfNeeded()
 
         loadLocalHistory()
+    }
+
+    private func migrateLegacyChatFilesIfNeeded() {
+        let legacySessions = baseChatDir.appendingPathComponent("sessions.json")
+        let legacyProjects = baseChatDir.appendingPathComponent("projects.json")
+        if FileManager.default.fileExists(atPath: legacySessions.path) && !FileManager.default.fileExists(atPath: sessionsURL.path) {
+            try? FileManager.default.copyItem(at: legacySessions, to: sessionsURL)
+            if FileManager.default.fileExists(atPath: legacyProjects.path) {
+                try? FileManager.default.copyItem(at: legacyProjects, to: projectsURL)
+            }
+            if let files = try? FileManager.default.contentsOfDirectory(at: baseChatDir, includingPropertiesForKeys: nil) {
+                for file in files where file.lastPathComponent.hasPrefix("messages_") {
+                    let dest = chatDir.appendingPathComponent(file.lastPathComponent)
+                    if !FileManager.default.fileExists(atPath: dest.path) {
+                        try? FileManager.default.copyItem(at: file, to: dest)
+                    }
+                }
+            }
+        }
+
+        // Migrate from acc_lsmcpwkugvviwrhx for antigravity-1 if it exists
+        let altAccDir = baseChatDir.appendingPathComponent("acc_lsmcpwkugvviwrhx")
+        if currentAccountKey == "antigravity-1" && !FileManager.default.fileExists(atPath: sessionsURL.path) && FileManager.default.fileExists(atPath: altAccDir.appendingPathComponent("sessions.json").path) {
+            try? FileManager.default.copyItem(at: altAccDir.appendingPathComponent("sessions.json"), to: sessionsURL)
+            if FileManager.default.fileExists(atPath: altAccDir.appendingPathComponent("projects.json").path) {
+                try? FileManager.default.copyItem(at: altAccDir.appendingPathComponent("projects.json"), to: projectsURL)
+            }
+            if let files = try? FileManager.default.contentsOfDirectory(at: altAccDir, includingPropertiesForKeys: nil) {
+                for file in files where file.lastPathComponent.hasPrefix("messages_") {
+                    let dest = chatDir.appendingPathComponent(file.lastPathComponent)
+                    if !FileManager.default.fileExists(atPath: dest.path) {
+                        try? FileManager.default.copyItem(at: file, to: dest)
+                    }
+                }
+            }
+        }
+    }
+
+    func switchAccount(server: String, token: String?, account: String? = nil) {
+        // 1. Flush existing state to old URLs synchronously before switching
+        let oldProjects = projects
+        let oldProjectsURL = projectsURL
+        if !oldProjects.isEmpty, let data = try? JSONEncoder().encode(oldProjects) {
+            try? data.write(to: oldProjectsURL, options: .atomic)
+        }
+        let oldSessions = sessions
+        let oldSessionsURL = sessionsURL
+        if !oldSessions.isEmpty, let data = try? JSONEncoder().encode(oldSessions) {
+            try? data.write(to: oldSessionsURL, options: .atomic)
+        }
+
+        let acctName = account ?? (currentAccount.isEmpty ? "antigravity-0" : currentAccount)
+        let cleanAcct = (acctName == "morrow-iphone" || acctName.isEmpty || acctName == "default") ? "antigravity-0" : acctName
+        self.currentAccount = cleanAcct
+        self.currentAccountKey = Self.accountKey(for: cleanAcct, token: token)
+        try? FileManager.default.createDirectory(at: chatDir, withIntermediateDirectories: true)
+        migrateLegacyChatFilesIfNeeded()
+
+        self.projects = []
+        self.sessions = []
+        self.messagesBySession = [:]
+        self.typingBySession = [:]
+        self.selectedSessionId = "default"
+
+        loadLocalHistory()
+
+        startPolling(server: server, token: token)
+        Task {
+            await sync(server: server, token: token)
+        }
     }
 
     // MARK: - Query Helpers
@@ -381,7 +507,7 @@ final class MobileChatStore: ObservableObject {
 
         if let srv = server {
             Task {
-                _ = try? await post(server: srv, path: "/api/chat/delete-conversation", payload: ["id": id], token: token)
+                _ = try? await post(server: srv, path: "/api/chat/delete-conversation", payload: ["id": id, "account": currentAccount], token: token)
             }
         }
     }
@@ -430,11 +556,12 @@ final class MobileChatStore: ObservableObject {
 
     func startPolling(server: String, token: String?) {
         syncTimer?.cancel()
+        // Responsive timer (2.5s) polling outbox for agent replies without UI jitter
         syncTimer = Timer.publish(every: 2.5, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 Task {
-                    await self?.sync(server: server, token: token)
+                    await self?.syncOutbox(server: server, token: token)
                 }
             }
     }
@@ -480,6 +607,7 @@ final class MobileChatStore: ObservableObject {
         let currentSession = sessions.first(where: { $0.id == targetSessionId })
         let payload: [String: Any] = [
             "id": userMsg.id,
+            "account": currentAccount,
             "session_id": targetSessionId,
             "project_id": currentSession?.projectId ?? "outside-of-project",
             "project_name": currentSession?.projectName ?? "Outside of Project",
@@ -498,8 +626,8 @@ final class MobileChatStore: ObservableObject {
                 messagesBySession[targetSessionId] = currentList
                 saveMessages(for: targetSessionId)
             }
-            // Trigger immediate sync
-            await sync(server: server, token: token)
+            // Trigger immediate outbox sync for response
+            await syncOutbox(server: server, token: token)
         } catch {
             errorMessage = "发送失败: \(error.localizedDescription)"
             if var currentList = messagesBySession[targetSessionId],
@@ -513,17 +641,14 @@ final class MobileChatStore: ObservableObject {
     }
 
     func sync(server: String, token: String?) async {
-        // 1. Always sync latest project conversations from VPS
         await fetchProjectConversations(server: server, token: token)
+        await syncOutbox(server: server, token: token)
+    }
 
-        // 2. Poll pending outbox messages staged for mobile
-        let payload: [String: Any] = [
-            "limit": 50,
-        ]
-
+    func syncOutbox(server: String, token: String?) async {
         do {
-            let res = try await post(server: server, path: "/api/chat/sync-outbox", payload: payload, token: token)
-            guard let rawMessages = res["messages"] as? [[String: Any]], !rawMessages.isEmpty else {
+            let data = try await post(server: server, path: "/api/chat/sync-outbox", payload: ["account": currentAccount], token: token)
+            guard let rawMessages = data["messages"] as? [[String: Any]], !rawMessages.isEmpty else {
                 return
             }
 
@@ -548,7 +673,23 @@ final class MobileChatStore: ObservableObject {
 
                     var list = messagesBySession[sid] ?? []
                     if !list.contains(where: { $0.id == item.id }) {
-                        list.append(item)
+                        var resolvedItem = item
+                        if resolvedItem.duration == nil {
+                            // Find corresponding user message to calculate elapsed duration
+                            if let repId = resolvedItem.replyTo, let userMsg = list.first(where: { $0.id == repId }) {
+                                let dur = resolvedItem.createdAt.timeIntervalSince(userMsg.createdAt)
+                                if dur > 0 && dur < 3600 {
+                                    resolvedItem.duration = dur
+                                }
+                            } else if let lastUser = list.last(where: { $0.sender == "user" }) {
+                                let dur = resolvedItem.createdAt.timeIntervalSince(lastUser.createdAt)
+                                if dur > 0 && dur < 3600 {
+                                    resolvedItem.duration = dur
+                                }
+                            }
+                        }
+
+                        list.append(resolvedItem)
                         list.sort(by: { $0.createdAt < $1.createdAt })
                         messagesBySession[sid] = list
                         changedSessionIds.insert(sid)
@@ -595,7 +736,7 @@ final class MobileChatStore: ObservableObject {
 
     func fetchProjectConversations(server: String, token: String?) async {
         do {
-            let data = try await post(server: server, path: "/api/chat/conversations", payload: [:], token: token)
+            let data = try await post(server: server, path: "/api/chat/conversations", payload: ["account": currentAccount], token: token)
 
             // 1. Parse projects
             if let rawProjects = data["projects"] as? [[String: Any]] {
@@ -609,7 +750,7 @@ final class MobileChatStore: ObservableObject {
                         loadedProjects.append(ChatProjectItem(id: id, name: name, icon: icon, count: count))
                     }
                 }
-                if !loadedProjects.isEmpty {
+                if self.projects != loadedProjects {
                     self.projects = loadedProjects
                     saveProjects()
                 }
@@ -617,7 +758,7 @@ final class MobileChatStore: ObservableObject {
 
             // 2. Parse conversations
             if let rawConvs = data["conversations"] as? [[String: Any]] {
-                var changedSessionIds: Set<String> = []
+                var hasChanges = false
                 for c in rawConvs {
                     guard let cid = c["id"] as? String, !cid.isEmpty else { continue }
                     let projId = c["project_id"] as? String ?? "outside-of-project"
@@ -631,6 +772,7 @@ final class MobileChatStore: ObservableObject {
                     // Parse messages if provided
                     if let rawMsgs = c["messages"] as? [[String: Any]], !rawMsgs.isEmpty {
                         var parsedMsgs: [ChatMessageItem] = []
+                        var lastUserCreatedAt: Date? = nil
                         for m in rawMsgs {
                             let mid = m["id"] as? String ?? UUID().uuidString
                             let role = m["role"] as? String ?? "agent"
@@ -642,19 +784,37 @@ final class MobileChatStore: ObservableObject {
                                 let f = ISO8601DateFormatter()
                                 createdAt = f.date(from: s) ?? Date()
                             }
+                            let isUserMsg = (role == "user")
+                            var duration = m["duration"] as? Double
+                            var tokens = m["tokens"] as? Int ?? m["token_count"] as? Int
+
+                            if isUserMsg {
+                                lastUserCreatedAt = createdAt
+                            } else {
+                                if duration == nil, let userTime = lastUserCreatedAt {
+                                    let dur = createdAt.timeIntervalSince(userTime)
+                                    if dur > 0 && dur < 3600 {
+                                        duration = dur
+                                    }
+                                }
+                            }
+
                             parsedMsgs.append(ChatMessageItem(
                                 id: mid,
                                 sessionId: cid,
-                                sender: role == "user" ? "user" : "agent",
+                                sender: isUserMsg ? "user" : "agent",
                                 type: "text",
                                 status: "completed",
                                 content: content,
-                                createdAt: createdAt
+                                createdAt: createdAt,
+                                tokens: tokens,
+                                duration: duration
                             ))
                         }
-                        if !parsedMsgs.isEmpty {
+                        if !parsedMsgs.isEmpty && messagesBySession[cid] != parsedMsgs {
                             messagesBySession[cid] = parsedMsgs
                             saveMessages(for: cid)
+                            hasChanges = true
                         }
                     }
 
@@ -668,15 +828,25 @@ final class MobileChatStore: ObservableObject {
                     }
 
                     if let idx = sessions.firstIndex(where: { $0.id == cid }) {
-                        sessions[idx].title = title
-                        sessions[idx].projectId = projId
-                        sessions[idx].projectName = projName
-                        sessions[idx].icon = icon
-                        if !snippet.isEmpty {
-                            sessions[idx].lastMessageSnippet = snippet
+                        let curr = sessions[idx]
+                        if curr.title != title ||
+                           curr.projectId != projId ||
+                           curr.projectName != projName ||
+                           curr.icon != icon ||
+                           (!snippet.isEmpty && curr.lastMessageSnippet != snippet) ||
+                           abs(curr.lastModifiedAt.timeIntervalSince(lastMod)) > 1 ||
+                           curr.msgCount != msgCount {
+                            sessions[idx].title = title
+                            sessions[idx].projectId = projId
+                            sessions[idx].projectName = projName
+                            sessions[idx].icon = icon
+                            if !snippet.isEmpty {
+                                sessions[idx].lastMessageSnippet = snippet
+                            }
+                            sessions[idx].lastModifiedAt = lastMod
+                            sessions[idx].msgCount = msgCount
+                            hasChanges = true
                         }
-                        sessions[idx].lastModifiedAt = lastMod
-                        sessions[idx].msgCount = msgCount
                     } else {
                         let newTopic = ChatSessionItem(
                             id: cid,
@@ -691,8 +861,8 @@ final class MobileChatStore: ObservableObject {
                             msgCount: msgCount
                         )
                         sessions.append(newTopic)
+                        hasChanges = true
                     }
-                    changedSessionIds.insert(cid)
                 }
 
                 // Prune any server-originating sessions deleted from server
@@ -716,8 +886,11 @@ final class MobileChatStore: ObservableObject {
                     }
                     return false
                 }
+                if sessions.count != beforeCount {
+                    hasChanges = true
+                }
 
-                if !changedSessionIds.isEmpty || sessions.count != beforeCount {
+                if hasChanges {
                     sortSessions()
                     saveSessions()
                     updateLocalProjectCounts()
@@ -731,7 +904,9 @@ final class MobileChatStore: ObservableObject {
     func updateLocalProjectCounts() {
         var counts: [String: (name: String, icon: String, count: Int, snippet: String, time: Date)] = [:]
         for s in sessions {
-            let pid = s.projectId.isEmpty ? "outside-of-project" : s.projectId
+            let pid = (s.projectId.isEmpty || s.projectId == "default") ? "outside-of-project" : s.projectId
+            let defaultName = (pid == "outside-of-project") ? "Outside of Project" : "新项目"
+            let pName = s.projectName.isEmpty ? defaultName : s.projectName
             if var existing = counts[pid] {
                 existing.count += 1
                 if s.lastModifiedAt > existing.time {
@@ -740,7 +915,7 @@ final class MobileChatStore: ObservableObject {
                 }
                 counts[pid] = existing
             } else {
-                counts[pid] = (s.projectName, s.icon, 1, s.lastMessageSnippet, s.lastModifiedAt)
+                counts[pid] = (pName, s.icon, 1, s.lastMessageSnippet, s.lastModifiedAt)
             }
         }
         var list: [ChatProjectItem] = []
@@ -751,7 +926,10 @@ final class MobileChatStore: ObservableObject {
             if let info = counts[p.id] {
                 list.append(ChatProjectItem(id: p.id, name: info.name, icon: info.icon, count: info.count, latestSnippet: info.snippet, latestTime: info.time))
             } else {
-                list.append(p)
+                var zeroP = p
+                zeroP.count = 0
+                zeroP.latestSnippet = ""
+                list.append(zeroP)
             }
         }
         for (pid, info) in counts {
@@ -759,8 +937,10 @@ final class MobileChatStore: ObservableObject {
                 list.append(ChatProjectItem(id: pid, name: info.name, icon: info.icon, count: info.count, latestSnippet: info.snippet, latestTime: info.time))
             }
         }
-        self.projects = list
-        saveProjects()
+        if self.projects != list {
+            self.projects = list
+            saveProjects()
+        }
     }
 
     func retryMessage(id: String, sessionId: String? = nil, server: String, token: String?) async {
@@ -778,6 +958,7 @@ final class MobileChatStore: ObservableObject {
 
         let payload: [String: Any] = [
             "id": item.id,
+            "account": currentAccount,
             "session_id": item.sessionId,
             "sender": "user",
             "type": item.type,
@@ -815,21 +996,32 @@ final class MobileChatStore: ObservableObject {
     }
 
     func saveProjects() {
-        if let data = try? JSONEncoder().encode(projects) {
-            try? data.write(to: projectsURL, options: .atomic)
+        let list = projects
+        let url = projectsURL
+        DispatchQueue.global(qos: .background).async {
+            if let data = try? JSONEncoder().encode(list) {
+                try? data.write(to: url, options: .atomic)
+            }
         }
     }
 
     private func saveSessions() {
-        if let data = try? JSONEncoder().encode(sessions) {
-            try? data.write(to: sessionsURL, options: .atomic)
+        let list = sessions
+        let url = sessionsURL
+        DispatchQueue.global(qos: .background).async {
+            if let data = try? JSONEncoder().encode(list) {
+                try? data.write(to: url, options: .atomic)
+            }
         }
     }
 
     private func saveMessages(for sessionId: String) {
         let list = messagesBySession[sessionId] ?? []
-        if let data = try? JSONEncoder().encode(list) {
-            try? data.write(to: sessionMessagesURL(for: sessionId), options: .atomic)
+        let url = sessionMessagesURL(for: sessionId)
+        DispatchQueue.global(qos: .background).async {
+            if let data = try? JSONEncoder().encode(list) {
+                try? data.write(to: url, options: .atomic)
+            }
         }
     }
 
