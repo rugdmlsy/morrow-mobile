@@ -48,7 +48,7 @@ struct ContentView: View {
             .tabItem {
                 Label("额度", systemImage: "hourglass.badge.plus")
             }
-            .badge(quotaStore.activeReminders.count)
+            .badge(quotaStore.activeReminders.count + quotaStore.nativeQuotas.values.filter { $0.isExhausted }.count)
         }
         .sheet(isPresented: $showSettings) {
             NavigationStack {
@@ -56,6 +56,9 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            Task {
+                await quotaStore.fetchNativeQuota(server: model.server, token: model.activeIdentity?.token)
+            }
             if UserDefaults.standard.bool(forKey: "mobile.intent.open_scanner") {
                 UserDefaults.standard.removeObject(forKey: "mobile.intent.open_scanner")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {

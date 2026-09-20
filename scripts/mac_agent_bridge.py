@@ -149,6 +149,7 @@ class MacAgentBridge:
         self._processed_msg_ids: set[str] = set()
         self._processing_msg_ids: set[str] = set()
         self._last_conv_sync_time: float = 0.0
+        self._last_quota_sync_time: float = 0.0
         self._last_db_mtimes: dict[str, float] = {}
 
     def stop(self) -> None:
@@ -854,6 +855,124 @@ class MacAgentBridge:
 
         return total_synced
 
+    def get_native_quota_status(self) -> dict[str, Any]:
+        """Discovers running Antigravity language_server instances and queries GetUserStatus."""
+        servers = []
+        try:
+            out = subprocess.check_output(["ps", "-ww", "-eo", "pid,ppid,command"], text=True)
+            for line in out.strip().split("\n"):
+                if "language_server" in line and "--csrf_token" in line:
+                    parts = line.strip().split(None, 2)
+                    if len(parts) < 3:
+                        continue
+                    pid = int(parts[0])
+                    ppid = int(parts[1])
+                    cmd = parts[2]
+                    csrf_match = re.search(r"--csrf_token\s+([a-f0-9\-]+)", cmd)
+                    csrf_token = csrf_match.group(1) if csrf_match else None
+                    if not csrf_token:
+                        continue
+
+                    parent_cmd = ""
+                    try:
+                        p_out = subprocess.check_output(["ps", "-o", "command=", "-p", str(ppid)], text=True)
+                        parent_cmd = p_out.strip()
+                    except Exception:
+                        pass
+
+                    account = "antigravity-1" if "Antigravity-Personal" in parent_cmd or "Antigravity-Personal" in cmd else "antigravity-0"
+
+                    ports = []
+                    try:
+                        lsof_out = subprocess.check_output(
+                            ["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"],
+                            text=True,
+                        )
+                        for l in lsof_out.strip().split("\n"):
+                            m = re.search(r":(\d+)\s+\(LISTEN\)", l)
+                            if m:
+                                ports.append(int(m.group(1)))
+                    except Exception:
+                        pass
+
+                    servers.append({
+                        "pid": pid,
+                        "account": account,
+                        "csrf_token": csrf_token,
+                        "ports": sorted(set(ports)),
+                    })
+        except Exception as exc:
+            logger.debug(f"Failed to scan language servers: {exc}")
+            return {}
+
+        results: dict[str, Any] = {}
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        for s in servers:
+            acct = s["account"]
+            if acct in results:
+                continue
+            for port in s["ports"]:
+                url = f"https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus"
+                req = urllib.request.Request(
+                    url,
+                    data=b"{}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-codeium-csrf-token": s["csrf_token"],
+                    },
+                )
+                try:
+                    with urllib.request.urlopen(req, context=ctx, timeout=2.5) as resp:
+                        raw = json.loads(resp.read().decode("utf-8"))
+                        us = raw.get("userStatus", {})
+                        if not us:
+                            continue
+                        user_name = us.get("name", "")
+                        user_email = us.get("email", "")
+                        user_tier = us.get("userTier", {}).get("name", "")
+                        model_configs = us.get("cascadeModelConfigData", {}).get("clientModelConfigs", [])
+                        models = []
+                        for m in model_configs:
+                            qi = m.get("quotaInfo", {})
+                            models.append({
+                                "label": m.get("label", ""),
+                                "model_id": m.get("modelId", ""),
+                                "remaining_fraction": qi.get("remainingFraction", 1.0),
+                                "reset_time": qi.get("resetTime"),
+                            })
+
+                        from datetime import timezone
+                        results[acct] = {
+                            "account": acct,
+                            "name": user_name,
+                            "email": user_email,
+                            "tier": user_tier,
+                            "models": models,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        break
+                except Exception:
+                    continue
+
+        return results
+
+    def sync_native_quota(self) -> int:
+        """Fetches native Antigravity quota from local language_server and syncs to VPS relay."""
+        quotas = self.get_native_quota_status()
+        if not quotas:
+            return 0
+        try:
+            res = self._request("/api/chat/sync-quota", payload={"quotas": quotas})
+            synced = res.get("data", {}).get("synced", len(quotas))
+            logger.info(f"Synced native quota for {len(quotas)} account(s) to VPS relay.")
+            return synced
+        except Exception as exc:
+            logger.warning(f"Failed to sync native quota to VPS relay: {exc}")
+            return 0
+
     def execute_agent(
         self,
         prompt: str,
@@ -1057,6 +1176,8 @@ class MacAgentBridge:
             try:
                 self.sync_project_conversations(account=profile["account"], force=True)
                 self._last_conv_sync_time = time.time()
+                self.sync_native_quota()
+                self._last_quota_sync_time = time.time()
             except Exception:
                 pass
         finally:
@@ -1074,14 +1195,25 @@ class MacAgentBridge:
         except Exception as exc:
             logger.warning(f"Initial conversation sync note: {exc}")
 
+        try:
+            self.sync_native_quota()
+            self._last_quota_sync_time = time.time()
+        except Exception as exc:
+            logger.warning(f"Initial quota sync note: {exc}")
+
         backoff = self.poll_interval_s
         while self._running:
             try:
-                # Periodic background sync of project conversations (only if db mtime changed)
                 now = time.time()
+                # Periodic background sync of project conversations (only if db mtime changed)
                 if now - self._last_conv_sync_time >= 15.0:
                     self.sync_project_conversations(force=False)
                     self._last_conv_sync_time = now
+
+                # Periodic background sync of native quota (every 30s)
+                if now - self._last_quota_sync_time >= 30.0:
+                    self.sync_native_quota()
+                    self._last_quota_sync_time = now
 
                 messages = self.pull_inbox()
                 if messages:

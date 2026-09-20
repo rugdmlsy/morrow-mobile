@@ -745,6 +745,11 @@ final class MobileChatStore: ObservableObject {
         do {
             let data = try await post(server: server, path: "/api/chat/conversations", payload: ["account": currentAccount], token: token)
 
+            // 0. Update Native Quotas if returned by relay
+            if let rawQuotas = data["quotas"] as? [String: Any], !rawQuotas.isEmpty {
+                QuotaResetStore.shared.updateFromRawQuotas(rawQuotas)
+            }
+
             // 1. Parse projects
             if let rawProjects = data["projects"] as? [[String: Any]] {
                 var loadedProjects: [ChatProjectItem] = []

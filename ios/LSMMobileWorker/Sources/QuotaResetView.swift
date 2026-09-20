@@ -59,32 +59,83 @@ struct QuotaResetView: View {
             } header: {
                 Text("监控账号")
             } footer: {
-                Text("系统会自动从该账号的对话记录中识别 429 与额度限制，并自动开启系统通知。")
+                Text("由 Mac 桥接器直接对接本地 Antigravity 核心引擎，自动上报权威原生配额。")
             }
 
-            // 3. Auto-Detected Quota Status (从对话记录自动读取)
+            // 3. Native Real-Time Quota & Reset Timers (原生精确配额与重置时间)
             Section {
-                autoDetectedStatusCard
-                    .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                if let nativeQuota = currentNativeQuota {
+                    nativeQuotaOverviewCard(nativeQuota)
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                        .listRowBackground(Color.clear)
+
+                    // Models Grid/List
+                    ForEach(nativeQuota.models) { modelQuota in
+                        nativeModelQuotaRow(modelQuota)
+                    }
+
+                    // Notification toggle
+                    Toggle(isOn: $store.enableNativeNotifications) {
+                        Label("额度恢复时自动发送系统推送", systemImage: "bell.badge.fill")
+                            .font(.system(size: 14, weight: .medium))
+                    }
+                    .tint(.blue)
+                    .padding(.vertical, 2)
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "gauge.with.needle")
+                            .font(.system(size: 32))
+                            .foregroundStyle(.secondary)
+                        Text("尚未获取到 \(selectedAccount) 的原生配额")
+                            .font(.system(size: 15, weight: .semibold))
+                        Text("请确保 Mac 本地 Antigravity 正在运行，且桥接器正常连接。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                        Button {
+                            refreshNativeQuota()
+                        } label: {
+                            if store.isFetchingNativeQuota {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Label("立即拉取原生配额", systemImage: "arrow.clockwise")
+                                    .font(.system(size: 14, weight: .medium))
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 16)
                     .listRowBackground(Color.clear)
+                }
             } header: {
                 HStack {
-                    Label("对话记录自动检测状态", systemImage: "sparkles")
+                    Label("Antigravity 原生配额与恢复时间", systemImage: "speedometer")
                     Spacer()
                     Button {
-                        rescanConversations()
+                        refreshNativeQuota()
                     } label: {
                         HStack(spacing: 4) {
-                            Image(systemName: "arrow.clockwise")
-                            Text("重新扫描")
+                            if store.isFetchingNativeQuota {
+                                ProgressView()
+                                    .controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            Text("刷新")
                         }
                         .font(.caption2)
                     }
                 }
+            } footer: {
+                if let nativeQuota = currentNativeQuota {
+                    Text("最近同步：\(formattedUpdateTime(nativeQuota.updatedAt)) · 准确度 100%（官方 RPC 实时数据）")
+                }
             }
 
-            // 4. Active Countdown Timers
-            if !currentAccountActiveReminders.isEmpty {
+            // 4. Conversation-detected Status & Active Timers (会话报错备用感应)
+            if !currentAccountActiveReminders.isEmpty || store.activeReminders.contains(where: { $0.account == selectedAccount }) {
                 Section {
                     ForEach(currentAccountActiveReminders) { reminder in
                         activeReminderCard(reminder)
@@ -93,7 +144,7 @@ struct QuotaResetView: View {
                     }
                 } header: {
                     HStack {
-                        Text("进行中的额度冷却倒计时")
+                        Text("会话 429 报错冷却倒计时")
                         Spacer()
                         Text("\(currentAccountActiveReminders.count) 个活跃")
                             .font(.caption2)
@@ -148,7 +199,7 @@ struct QuotaResetView: View {
             } header: {
                 Text("手动备用设定（可选）")
             } footer: {
-                Text("平时系统会全自动从对话记录中检测并启动提醒；此区域仅供手动快速设定或测试。")
+                Text("平时原生配额会自动更新；此区域仅供手动快速设定或测试。")
             }
 
             // 6. History / Completed Section
@@ -188,13 +239,23 @@ struct QuotaResetView: View {
             }
         }
         .navigationTitle("额度重置提醒")
+        .refreshable {
+            await store.fetchNativeQuota(server: model.server, token: model.activeIdentity?.token, account: selectedAccount)
+            store.scanAndSyncFromChatStore()
+        }
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
                     Button {
+                        refreshNativeQuota()
+                    } label: {
+                        Label("立即同步原生额度", systemImage: "speedometer")
+                    }
+
+                    Button {
                         rescanConversations()
                     } label: {
-                        Label("重新扫描对话记录", systemImage: "arrow.clockwise")
+                        Label("扫描对话记录", systemImage: "sparkles")
                     }
 
                     Button {
@@ -231,6 +292,10 @@ struct QuotaResetView: View {
             }
             store.checkNotificationStatus()
             store.scanAndSyncFromChatStore()
+            refreshNativeQuota()
+        }
+        .onChange(of: selectedAccount) { _ in
+            refreshNativeQuota()
         }
         .sheet(isPresented: $showCustomSheet) {
             CustomDurationSheet(account: selectedAccount) { duration, note in
@@ -263,129 +328,207 @@ struct QuotaResetView: View {
         }
     }
 
-    // MARK: - Auto-Detected Status Card
+    // MARK: - Native Quota UI Components (原生配额组件)
+
+    private var currentNativeQuota: NativeAccountQuota? {
+        store.nativeQuotas[selectedAccount] ?? store.nativeQuotas[selectedAccount.lowercased()]
+    }
 
     @ViewBuilder
-    private var autoDetectedStatusCard: some View {
-        let activeReminders = currentAccountActiveReminders
-        if let autoReminder = activeReminders.first(where: { $0.isAutoDetected }) ?? activeReminders.first {
-            let is5h = autoReminder.type == .fiveHours
-            let themeColor: Color = is5h ? .blue : (autoReminder.type == .oneWeek ? .purple : .orange)
+    private func nativeQuotaOverviewCard(_ quota: NativeAccountQuota) -> some View {
+        let isExhausted = quota.isExhausted
+        let isWarning = quota.isWarning
+        let themeColor: Color = isExhausted ? .red : (isWarning ? .orange : .green)
 
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(alignment: .center, spacing: 8) {
-                    Image(systemName: "bolt.fill")
-                        .foregroundStyle(themeColor)
-                        .font(.system(size: 16))
-                    Text("已从对话记录自动识别受限")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(themeColor)
-                    Spacer()
-                    Text("自动提醒已生效")
-                        .font(.caption2.weight(.semibold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(themeColor.opacity(0.15), in: Capsule())
-                        .foregroundStyle(themeColor)
-                }
+        VStack(alignment: .leading, spacing: 12) {
+            // Account Info & Tier
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: "person.crop.circle.badge.checkmark")
+                    .font(.system(size: 24))
+                    .foregroundStyle(themeColor)
 
-                if let title = autoReminder.sourceSessionTitle {
-                    Text("来源对话：\(title)")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.primary)
-                }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(quota.email ?? quota.name ?? quota.account)
+                            .font(.system(size: 15, weight: .bold))
+                            .lineLimit(1)
 
-                if let snippet = autoReminder.triggerSnippet {
-                    Text("\"\(snippet)\"")
-                        .font(.caption)
+                        if let tier = quota.tier, !tier.isEmpty {
+                            Text(tier)
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.blue.opacity(0.15), in: Capsule())
+                                .foregroundStyle(Color.blue)
+                        }
+                    }
+
+                    Text("官方原生鉴权账号 · \(quota.account)")
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .padding(8)
-                        .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
                 }
 
+                Spacer()
+
+                // Health Badge
+                Text(isExhausted ? "配额耗尽" : (isWarning ? "配额偏低" : "状态正常"))
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(themeColor.opacity(0.15), in: Capsule())
+                    .foregroundStyle(themeColor)
+            }
+
+            Divider()
+
+            // Lowest model or Earliest Reset
+            if isExhausted, let lowest = quota.lowestModel, let resetTime = lowest.resetTime {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("距离额度重置剩余")
+                        Text("受限模型恢复倒计时")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                        Text(autoReminder.formattedRemaining)
+                        Text(lowest.formattedCountdown)
                             .font(.system(size: 26, weight: .heavy, design: .monospaced))
-                            .foregroundStyle(themeColor)
+                            .foregroundStyle(.red)
                     }
                     Spacer()
                     VStack(alignment: .trailing, spacing: 2) {
-                        Text("预计恢复时间")
+                        Text("官方精确重置点")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                        Text(autoReminder.formattedTargetTime)
+                        Text(lowest.formattedResetTime)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(.primary)
                     }
                 }
 
-                ProgressView(value: autoReminder.progress)
-                    .tint(themeColor)
-                    .scaleEffect(x: 1, y: 1.5, anchor: .center)
-
                 HStack(spacing: 4) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                    Image(systemName: "bell.badge.fill")
+                        .foregroundStyle(.blue)
                         .font(.caption2)
-                    Text("本地系统推送已就绪，恢复时将准时提醒。")
+                    Text("到期重置时，iOS 将准时弹出系统通知。")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-            }
-            .padding(14)
-            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(themeColor.opacity(0.3), lineWidth: 1.5)
-            )
-            .shadow(color: Color.black.opacity(0.04), radius: 6, y: 2)
-        } else {
-            // Healthy status card
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    Image(systemName: "checkmark.shield.fill")
-                        .font(.system(size: 28))
-                        .foregroundStyle(.green)
-
+            } else {
+                HStack {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("对话记录扫描完成：额度健康")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(.green)
-                        Text("已扫描 \(chatStore.sessions.count) 场对话记录，未发现 429 或配额上限。")
-                            .font(.caption)
+                        Text("主模型可用配额")
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
+                        let lowestFraction = quota.lowestModel?.remainingPercentFormatted ?? "100.0%"
+                        Text(lowestFraction)
+                            .font(.system(size: 24, weight: .bold, design: .rounded))
+                            .foregroundStyle(themeColor)
                     }
                     Spacer()
-                }
-
-                Divider()
-
-                HStack {
-                    Text("当前账号：\(selectedAccount)")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Text("自动持续监控中")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.green)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Color.green.opacity(0.12), in: Capsule())
+                    if let earliest = quota.earliestResetModel, earliest.timeRemaining > 0 {
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("预计滚动恢复")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(earliest.formattedResetTime)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
-            .padding(14)
-            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16)
-                    .stroke(Color.green.opacity(0.25), lineWidth: 1)
-            )
         }
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(themeColor.opacity(0.3), lineWidth: 1.5)
+        )
+        .shadow(color: Color.black.opacity(0.04), radius: 6, y: 2)
     }
+
+    @ViewBuilder
+    private func nativeModelQuotaRow(_ model: NativeModelQuota) -> some View {
+        let isEx = model.isExhausted
+        let isWarn = model.isWarning
+        let rowColor: Color = isEx ? .red : (isWarn ? .orange : .green)
+
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(model.label)
+                    .font(.system(size: 14, weight: .semibold))
+                    .lineLimit(1)
+                Spacer()
+                Text(model.remainingPercentFormatted)
+                    .font(.system(size: 13, weight: .bold, design: .monospaced))
+                    .foregroundStyle(rowColor)
+            }
+
+            ProgressView(value: model.remainingFraction)
+                .tint(rowColor)
+                .scaleEffect(x: 1, y: 1.2, anchor: .center)
+
+            HStack {
+                if let resetTime = model.resetTime, resetTime > Date() {
+                    Text("重置时间: \(model.formattedResetTime)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("倒计时: \(model.formattedCountdown)")
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(rowColor)
+                } else {
+                    Text("配额状态稳定")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("随时可用")
+                        .font(.caption2)
+                        .foregroundStyle(.green)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Legacy Active Reminders UI
+
+    @ViewBuilder
+    private func activeReminderCard(_ reminder: QuotaReminder) -> some View {
+        let is5h = reminder.type == .fiveHours
+        let themeColor: Color = is5h ? .blue : (reminder.type == .oneWeek ? .purple : .orange)
+
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label(reminder.type.title, systemImage: reminder.type.icon)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(themeColor)
+                Spacer()
+                Text(reminder.formattedTargetTime)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(alignment: .firstTextBaseline) {
+                Text(reminder.formattedRemaining)
+                    .font(.system(size: 24, weight: .bold, design: .monospaced))
+                    .foregroundStyle(themeColor)
+                Spacer()
+                Text("距离恢复")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            ProgressView(value: reminder.progress)
+                .tint(themeColor)
+        }
+        .padding(12)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(themeColor.opacity(0.25), lineWidth: 1)
+        )
+    }
+
+    // MARK: - Actions & Helpers
 
     private var availableAccounts: [String] {
         var list = model.accounts.map { $0.name }
@@ -397,6 +540,13 @@ struct QuotaResetView: View {
 
     private var currentAccountActiveReminders: [QuotaReminder] {
         store.activeReminders.filter { $0.account.lowercased() == selectedAccount.lowercased() }
+    }
+
+    private func refreshNativeQuota() {
+        Task {
+            await store.fetchNativeQuota(server: model.server, token: model.activeIdentity?.token, account: selectedAccount)
+            showBanner("已同步 \(selectedAccount) 原生配额！")
+        }
     }
 
     private func rescanConversations() {
@@ -445,6 +595,17 @@ struct QuotaResetView: View {
         }
     }
 
+    private func formattedUpdateTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        let calendar = Calendar.current
+        if calendar.isDateInToday(date) {
+            formatter.dateFormat = "今日 HH:mm:ss"
+        } else {
+            formatter.dateFormat = "M月d日 HH:mm:ss"
+        }
+        return formatter.string(from: date)
+    }
+
     @ViewBuilder
     private func quotaActionCard(
         type: QuotaType,
@@ -454,140 +615,75 @@ struct QuotaResetView: View {
         systemImage: String,
         action: @escaping () -> Void
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .center, spacing: 10) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(color)
-                    .frame(width: 32, height: 32)
-                    .background(color.opacity(0.12), in: Circle())
+        Button(action: action) {
+            HStack(spacing: 12) {
+                ZStack {
+                    Circle()
+                        .fill(color.opacity(0.12))
+                        .frame(width: 42, height: 42)
+                    Image(systemName: systemImage)
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(color)
+                }
 
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text(type.title)
-                            .font(.system(size: 16, weight: .semibold))
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.primary)
+
                         Text(tagText)
                             .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(color)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
                             .background(color.opacity(0.15), in: Capsule())
+                            .foregroundStyle(color)
                     }
+
                     Text(description)
-                        .font(.system(size: 12))
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
-                Spacer()
-            }
 
-            Button(action: action) {
-                HStack {
-                    Spacer()
-                    Image(systemName: "bell.badge.fill")
-                        .font(.caption)
-                    Text("设定 \(type.shortTag) 重置提醒")
-                        .font(.system(size: 14, weight: .semibold))
-                    Spacer()
-                }
-                .padding(.vertical, 8)
-                .background(color.opacity(0.15), in: RoundedRectangle(cornerRadius: 10))
-                .foregroundStyle(color)
+                Spacer()
+
+                Image(systemName: "plus.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(color)
             }
-            .buttonStyle(.plain)
+            .padding(12)
+            .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(color.opacity(0.2), lineWidth: 1)
+            )
         }
-        .padding(14)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(color.opacity(0.2), lineWidth: 1)
-        )
-    }
-
-    @ViewBuilder
-    private func activeReminderCard(_ reminder: QuotaReminder) -> some View {
-        let is5h = reminder.type == .fiveHours
-        let themeColor: Color = is5h ? .blue : (reminder.type == .oneWeek ? .purple : .orange)
-
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Image(systemName: reminder.type.icon)
-                            .foregroundStyle(themeColor)
-                        Text(reminder.type.title)
-                            .font(.system(size: 16, weight: .bold))
-                        if reminder.isAutoDetected {
-                            Text("自动识别")
-                                .font(.caption2.weight(.semibold))
-                                .foregroundStyle(Color.accentColor)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.accentColor.opacity(0.12), in: Capsule())
-                        } else {
-                            Text("手动设定")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.secondary.opacity(0.15), in: Capsule())
-                        }
-                    }
-
-                    if let note = reminder.note, !note.isEmpty {
-                        Text(note)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                Spacer()
-                Button(role: .destructive) {
-                    store.cancelReminder(id: reminder.id)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 20))
-                        .foregroundStyle(.secondary.opacity(0.6))
-                }
-                .buttonStyle(.plain)
-            }
-
-            // Big Countdown Display
-            HStack(alignment: .firstTextBaseline) {
-                Text(reminder.formattedRemaining)
-                    .font(.system(size: 28, weight: .heavy, design: .monospaced))
-                    .foregroundStyle(themeColor)
-                Spacer()
-                Text("预计恢复")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(reminder.formattedTargetTime)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Color.primary)
-            }
-
-            // Progress Bar
-            ProgressView(value: reminder.progress)
-                .tint(themeColor)
-                .scaleEffect(x: 1, y: 1.5, anchor: .center)
-        }
-        .padding(14)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
-        .overlay(
-            RoundedRectangle(cornerRadius: 16)
-                .stroke(themeColor.opacity(0.25), lineWidth: 1)
-        )
-        .shadow(color: Color.black.opacity(0.04), radius: 6, y: 2)
+        .buttonStyle(.plain)
     }
 }
 
+// MARK: - Custom Duration Sheet
+
 struct CustomDurationSheet: View {
     let account: String
-    let onSchedule: (TimeInterval, String?) -> Void
-    @Environment(\.dismiss) private var dismiss
+    var onConfirm: (TimeInterval, String?) -> Void
 
-    @State private var selectedPresetHours: Double = 3.0
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedPresetHours: Int? = 5
+    @State private var useExactTargetDate: Bool = false
+    @State private var targetDate: Date = Date().addingTimeInterval(5 * 3600)
     @State private var note: String = ""
-    @State private var useExactDatePicker: Bool = false
-    @State private var exactDate: Date = Date().addingTimeInterval(3600 * 3)
+
+    private let presets: [(String, Int)] = [
+        ("+1 小时", 1),
+        ("+2 小时", 2),
+        ("+3 小时", 3),
+        ("+5 小时", 5),
+        ("+12 小时", 12),
+        ("+24 小时", 24),
+        ("+7 天", 7 * 24)
+    ]
 
     var body: some View {
         NavigationStack {
@@ -597,85 +693,70 @@ struct CustomDurationSheet: View {
                         Text("目标账号")
                         Spacer()
                         Text(account)
+                            .font(.system(.body, design: .monospaced))
                             .foregroundStyle(.secondary)
-                            .fontWeight(.semibold)
                     }
                 }
 
-                Section("预设快捷时长") {
-                    HStack(spacing: 8) {
-                        presetButton(label: "+1 小时", hours: 1.0)
-                        presetButton(label: "+2 小时", hours: 2.0)
-                        presetButton(label: "+3 小时", hours: 3.0)
-                        presetButton(label: "+12 小时", hours: 12.0)
-                        presetButton(label: "+24 小时", hours: 24.0)
+                Section("快捷时长选择") {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 80))], spacing: 10) {
+                        ForEach(presets, id: \.1) { label, hours in
+                            Button {
+                                selectedPresetHours = hours
+                                useExactTargetDate = false
+                                targetDate = Date().addingTimeInterval(Double(hours) * 3600)
+                            } label: {
+                                Text(label)
+                                    .font(.system(size: 13, weight: .medium))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                                    .background(selectedPresetHours == hours && !useExactTargetDate ? Color.accentColor : Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
+                                    .foregroundStyle(selectedPresetHours == hours && !useExactTargetDate ? Color.white : Color.primary)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
-                    .padding(.vertical, 2)
+                    .padding(.vertical, 4)
                 }
 
-                Section("或自定义时间") {
-                    Toggle("选择精确到期时间点", isOn: $useExactDatePicker)
+                Section("精确重置日期与时间") {
+                    Toggle("指定具体恢复时间点", isOn: $useExactTargetDate)
+                        .onChange(of: useExactTargetDate) { isExact in
+                            if isExact { selectedPresetHours = nil }
+                        }
 
-                    if useExactDatePicker {
-                        DatePicker("到期时间", selection: $exactDate, in: Date()..., displayedComponents: [.date, .hourAndMinute])
+                    if useExactTargetDate {
+                        DatePicker("目标恢复时间", selection: $targetDate, in: Date()..., displayedComponents: [.date, .hourAndMinute])
                             .datePickerStyle(.graphical)
-                    } else {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("时长: \(String(format: "%.1f", selectedPresetHours)) 小时")
-                                .font(.system(size: 15, weight: .medium))
-                            Slider(value: $selectedPresetHours, in: 0.5...48.0, step: 0.5)
-                        }
-                        .padding(.vertical, 4)
                     }
                 }
 
-                Section("备注说明 (可选)") {
-                    TextField("如：等待深夜重置 / 尝试切换模型", text: $note)
-                }
-
-                Section {
-                    Button {
-                        let duration: TimeInterval
-                        if useExactDatePicker {
-                            duration = max(60, exactDate.timeIntervalSince(Date()))
-                        } else {
-                            duration = selectedPresetHours * 3600
-                        }
-                        onSchedule(duration, note.isEmpty ? nil : note)
-                        dismiss()
-                    } label: {
-                        HStack {
-                            Spacer()
-                            Text("确认并启动提醒")
-                                .fontWeight(.semibold)
-                            Spacer()
-                        }
-                    }
+                Section("备注说明（可选）") {
+                    TextField("例如：因连续生图额度耗尽", text: $note)
                 }
             }
-            .navigationTitle("自定义额度时长")
+            .navigationTitle("自选额度时长")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }
                 }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("确定启用") {
+                        let duration: TimeInterval
+                        if useExactTargetDate {
+                            duration = max(60, targetDate.timeIntervalSince(Date()))
+                        } else if let hours = selectedPresetHours {
+                            duration = Double(hours) * 3600
+                        } else {
+                            duration = 5 * 3600
+                        }
+                        onConfirm(duration, note.isEmpty ? nil : note)
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                }
             }
         }
-    }
-
-    @ViewBuilder
-    private func presetButton(label: String, hours: Double) -> some View {
-        Button {
-            selectedPresetHours = hours
-            useExactDatePicker = false
-        } label: {
-            Text(label)
-                .font(.system(size: 11, weight: selectedPresetHours == hours && !useExactDatePicker ? .bold : .regular))
-                .padding(.horizontal, 6)
-                .padding(.vertical, 6)
-                .background(selectedPresetHours == hours && !useExactDatePicker ? Color.accentColor : Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 8))
-                .foregroundStyle(selectedPresetHours == hours && !useExactDatePicker ? Color.white : Color.primary)
-        }
-        .buttonStyle(.plain)
     }
 }

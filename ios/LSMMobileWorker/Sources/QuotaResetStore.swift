@@ -40,6 +40,92 @@ enum QuotaType: String, Codable, CaseIterable {
     }
 }
 
+// MARK: - Native Antigravity Quota Models (原生精确配额模型)
+
+struct NativeModelQuota: Identifiable, Codable, Equatable {
+    var id: String { modelId.isEmpty ? label : modelId }
+    let label: String
+    let modelId: String
+    let remainingFraction: Double
+    let resetTime: Date?
+
+    var remainingPercent: Double {
+        remainingFraction * 100.0
+    }
+
+    var remainingPercentFormatted: String {
+        String(format: "%.1f%%", remainingPercent)
+    }
+
+    var isExhausted: Bool {
+        remainingFraction <= 0.05
+    }
+
+    var isWarning: Bool {
+        remainingFraction > 0.05 && remainingFraction <= 0.20
+    }
+
+    var formattedResetTime: String {
+        guard let resetTime = resetTime else { return "无限制" }
+        let formatter = DateFormatter()
+        let calendar = Calendar.current
+        if calendar.isDateInToday(resetTime) {
+            formatter.dateFormat = "今日 HH:mm:ss"
+        } else if calendar.isDateInTomorrow(resetTime) {
+            formatter.dateFormat = "明日 HH:mm:ss"
+        } else {
+            formatter.dateFormat = "M月d日 HH:mm"
+        }
+        return formatter.string(from: resetTime)
+    }
+
+    var timeRemaining: TimeInterval {
+        guard let resetTime = resetTime else { return 0 }
+        return max(0, resetTime.timeIntervalSince(Date()))
+    }
+
+    var formattedCountdown: String {
+        let remaining = timeRemaining
+        if remaining <= 0 { return "已恢复" }
+        let total = Int(remaining)
+        let hours = total / 3600
+        let mins = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%02d:%02d:%02d", hours, mins, secs)
+        } else {
+            return String(format: "%02d:%02d", mins, secs)
+        }
+    }
+}
+
+struct NativeAccountQuota: Identifiable, Codable, Equatable {
+    var id: String { account }
+    let account: String
+    let name: String?
+    let email: String?
+    let tier: String?
+    let models: [NativeModelQuota]
+    let updatedAt: Date
+
+    var lowestModel: NativeModelQuota? {
+        models.min { $0.remainingFraction < $1.remainingFraction }
+    }
+
+    var earliestResetModel: NativeModelQuota? {
+        models.filter { ($0.resetTime ?? .distantPast) > Date() }
+              .min { ($0.resetTime ?? .distantFuture) < ($1.resetTime ?? .distantFuture) }
+    }
+
+    var isExhausted: Bool {
+        lowestModel?.isExhausted ?? false
+    }
+
+    var isWarning: Bool {
+        lowestModel?.isWarning ?? false
+    }
+}
+
 struct QuotaReminder: Identifiable, Codable, Equatable {
     let id: String
     let account: String
@@ -119,16 +205,28 @@ struct QuotaReminder: Identifiable, Codable, Equatable {
 final class QuotaResetStore: ObservableObject {
     static let shared = QuotaResetStore()
     private static let key = "mobile.quota.reminders.v1"
+    private static let nativeKey = "mobile.native.quota.v1"
 
     @Published private(set) var reminders: [QuotaReminder] = []
     @Published private(set) var notificationAuthorized: Bool = false
     @Published private(set) var lastScanTime: Date? = nil
     @Published private(set) var scannedSessionsCount: Int = 0
 
+    // MARK: - Native Quota State
+    @Published private(set) var nativeQuotas: [String: NativeAccountQuota] = [:]
+    @Published private(set) var isFetchingNativeQuota: Bool = false
+    @Published private(set) var lastNativeFetchTime: Date? = nil
+    @Published var enableNativeNotifications: Bool = true {
+        didSet {
+            UserDefaults.standard.set(enableNativeNotifications, forKey: "mobile.quota.enable_native_notifs")
+        }
+    }
+
     private var timer: Timer?
 
     private init() {
         load()
+        loadNative()
         checkNotificationStatus()
         startPeriodicTimer()
     }
@@ -419,11 +517,137 @@ final class QuotaResetStore: ObservableObject {
         objectWillChange.send()
     }
 
+    // MARK: - Native Quota Methods (原生配额管理)
+
+    func updateFromRawQuotas(_ rawQuotas: [String: Any]) {
+        var updated = nativeQuotas
+        for (acct, rawVal) in rawQuotas {
+            guard let dict = rawVal as? [String: Any] else { continue }
+            let name = dict["name"] as? String
+            let email = dict["email"] as? String
+            let tier = dict["tier"] as? String
+            let updatedStr = dict["updated_at"] as? String
+            let updateDate = parseIsoDate(updatedStr) ?? Date()
+
+            var parsedModels: [NativeModelQuota] = []
+            if let rawModels = dict["models"] as? [[String: Any]] {
+                for m in rawModels {
+                    let label = m["label"] as? String ?? ""
+                    let modelId = m["model_id"] as? String ?? ""
+                    let rem = (m["remaining_fraction"] as? NSNumber)?.doubleValue ?? 1.0
+                    let resetStr = m["reset_time"] as? String
+                    let resetTime = parseIsoDate(resetStr)
+                    if !label.isEmpty {
+                        parsedModels.append(NativeModelQuota(
+                            label: label,
+                            modelId: modelId,
+                            remainingFraction: rem,
+                            resetTime: resetTime
+                        ))
+                    }
+                }
+            }
+            updated[acct] = NativeAccountQuota(
+                account: acct,
+                name: name,
+                email: email,
+                tier: tier,
+                models: parsedModels,
+                updatedAt: updateDate
+            )
+        }
+        self.nativeQuotas = updated
+        self.lastNativeFetchTime = Date()
+        self.saveNative()
+        self.syncNativeNotifications()
+        self.objectWillChange.send()
+    }
+
+    func fetchNativeQuota(server: String, token: String?, account: String? = nil) async {
+        guard !server.isEmpty else { return }
+        isFetchingNativeQuota = true
+        defer { isFetchingNativeQuota = false }
+
+        var urlStr = server.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/api/chat/quota"
+        if let account = account, !account.isEmpty {
+            urlStr += "?account=\(account)"
+        }
+        guard let url = URL(string: urlStr) else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        if let token = token, !token.isEmpty {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return
+            }
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let dataObj = json["data"] as? [String: Any],
+               let quotasObj = dataObj["quotas"] as? [String: Any] {
+                updateFromRawQuotas(quotasObj)
+            }
+        } catch {
+            // Ignore background network error
+        }
+    }
+
+    func syncNativeNotifications() {
+        guard enableNativeNotifications else { return }
+        Task {
+            for (acct, accountQuota) in nativeQuotas {
+                for model in accountQuota.models where model.isExhausted {
+                    guard let resetTime = model.resetTime, resetTime > Date() else { continue }
+                    await scheduleNativeResetNotification(account: acct, model: model, resetTime: resetTime)
+                }
+            }
+        }
+    }
+
+    private func scheduleNativeResetNotification(account: String, model: NativeModelQuota, resetTime: Date) async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        if settings.authorizationStatus != .authorized && settings.authorizationStatus != .provisional {
+            _ = try? await center.requestAuthorization(options: [.alert, .badge, .sound])
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = "🎉 额度已恢复 (\(account))"
+        content.body = "Agent [\(account)] 的 \(model.label) 配额已经恢复，现在可以继续发送任务了！"
+        content.sound = .default
+        if #available(iOS 15.0, *) {
+            content.interruptionLevel = .timeSensitive
+        }
+
+        let duration = max(1.0, resetTime.timeIntervalSince(Date()))
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: duration, repeats: false)
+        let identifier = "native-quota-reset-\(account)-\(model.modelId)"
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
+        try? await center.add(request)
+    }
+
+    private func parseIsoDate(_ string: String?) -> Date? {
+        guard let string = string, !string.isEmpty else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = formatter.date(from: string) { return d }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: string)
+    }
+
     private func startPeriodicTimer() {
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                if self.reminders.contains(where: { $0.isActive }) {
+                let hasActiveReminders = self.reminders.contains(where: { $0.isActive })
+                let hasActiveNativeResets = self.nativeQuotas.values.contains { acct in
+                    acct.models.contains { ($0.resetTime ?? .distantPast) > Date() }
+                }
+                if hasActiveReminders || hasActiveNativeResets {
                     self.objectWillChange.send()
                 }
             }
@@ -481,6 +705,22 @@ final class QuotaResetStore: ObservableObject {
     private func save() {
         if let data = try? JSONEncoder().encode(reminders) {
             UserDefaults.standard.set(data, forKey: Self.key)
+        }
+    }
+
+    private func loadNative() {
+        if let data = UserDefaults.standard.data(forKey: Self.nativeKey),
+           let decoded = try? JSONDecoder().decode([String: NativeAccountQuota].self, from: data) {
+            nativeQuotas = decoded
+        }
+        if UserDefaults.standard.object(forKey: "mobile.quota.enable_native_notifs") != nil {
+            enableNativeNotifications = UserDefaults.standard.bool(forKey: "mobile.quota.enable_native_notifs")
+        }
+    }
+
+    private func saveNative() {
+        if let data = try? JSONEncoder().encode(nativeQuotas) {
+            UserDefaults.standard.set(data, forKey: Self.nativeKey)
         }
     }
 }
