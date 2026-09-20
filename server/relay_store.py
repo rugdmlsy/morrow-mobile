@@ -18,6 +18,26 @@ from .models import (
 )
 
 
+def _parse_timestamp(val: Any, default: float) -> float:
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return float(val)
+    val_str = str(val).strip()
+    if not val_str:
+        return default
+    try:
+        return float(val_str)
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime
+        clean = val_str[:-1] + "+00:00" if val_str.endswith("Z") else val_str
+        return datetime.fromisoformat(clean).timestamp()
+    except Exception:
+        return default
+
+
 class ChatRelayStore:
     """Manages ephemeral inbox, outbox, and conversation staging queues."""
 
@@ -253,7 +273,7 @@ class ChatRelayStore:
                 title = c.get("title", "新对话")
                 snippet = c.get("snippet", "")
                 msg_count = int(c.get("msg_count", 0))
-                last_mod = float(c.get("last_modified_at", now))
+                last_mod = _parse_timestamp(c.get("last_modified_at"), now)
                 msgs_json = json.dumps(c.get("messages", []), ensure_ascii=False)
 
                 self._conn.execute(

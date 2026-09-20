@@ -162,6 +162,7 @@ async def conversations(request: Request) -> JSONResponse:
 
     store = get_store()
     data = store.get_project_conversations(account=account)
+    data["quotas"] = store.get_account_quotas()
     return JSONResponse({"ok": True, "data": data})
 
 

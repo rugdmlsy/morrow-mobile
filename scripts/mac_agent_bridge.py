@@ -871,16 +871,27 @@ class MacAgentBridge:
         """Queries local language_server processes for native Antigravity quota information."""
         servers = []
         try:
-            out = subprocess.check_output(["ps", "-ef"], text=True)
-            for line in out.splitlines():
-                if "language_server" in line and "--csrf_token" in line:
-                    parts = line.split()
-                    pid = parts[1]
+            ps_out = subprocess.check_output(["ps", "-eo", "pid,ppid,command"], text=True)
+            for line in ps_out.splitlines():
+                if "/language_server " in line and "--csrf_token" in line:
+                    m = re.match(r"\s*(\d+)\s+(\d+)", line)
+                    if not m:
+                        continue
+                    pid, ppid = m.group(1), m.group(2)
                     m_token = re.search(r"--csrf_token\s+([a-f0-9\-]+)", line)
                     if not m_token:
                         continue
                     csrf_token = m_token.group(1)
-                    account = "antigravity-1" if "antigravity-personal" in line.lower() else "antigravity-0"
+
+                    try:
+                        parent_cmd = subprocess.check_output(
+                            ["ps", "-ww", "-p", ppid, "-o", "command="], text=True
+                        ).strip()
+                    except Exception:
+                        parent_cmd = ""
+
+                    is_personal = "antigravity-personal" in parent_cmd.lower()
+                    account = "antigravity-1" if is_personal else "antigravity-0"
 
                     ports: list[int] = []
                     try:
@@ -889,14 +900,15 @@ class MacAgentBridge:
                             text=True,
                         )
                         for pline in lsof_out.splitlines():
-                            m = re.search(r":(\d+)$", pline)
-                            if m:
-                                ports.append(int(m.group(1)))
+                            m_p = re.search(r":(\d+)$", pline)
+                            if m_p:
+                                ports.append(int(m_p.group(1)))
                     except Exception:
                         pass
 
                     servers.append({
                         "pid": pid,
+                        "ppid": ppid,
                         "account": account,
                         "csrf_token": csrf_token,
                         "ports": sorted(set(ports)),
@@ -911,9 +923,6 @@ class MacAgentBridge:
         ctx.verify_mode = ssl.CERT_NONE
 
         for s in servers:
-            acct = s["account"]
-            if acct in results:
-                continue
             for port in s["ports"]:
                 url = f"https://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/GetUserStatus"
                 req = urllib.request.Request(
@@ -933,6 +942,16 @@ class MacAgentBridge:
                         user_name = us.get("name", "")
                         user_email = us.get("email", "")
                         user_tier = us.get("userTier", {}).get("name", "")
+
+                        acct = s["account"]
+                        if "rifurookie" in user_email.lower():
+                            acct = "antigravity-1"
+                        elif "xyc0609" in user_email.lower():
+                            acct = "antigravity-0"
+
+                        if acct in results:
+                            break
+
                         model_configs = us.get("cascadeModelConfigData", {}).get("clientModelConfigs", [])
                         models = []
                         for m in model_configs:
@@ -979,12 +998,8 @@ class MacAgentBridge:
         aggregated = []
         if gemini_models:
             min_frac = min(m.get("remaining_fraction", 1.0) for m in gemini_models)
-            exhausted = [m for m in gemini_models if m.get("remaining_fraction", 1.0) <= 0.05]
-            if exhausted:
-                reset_times = [m.get("reset_time") for m in exhausted if m.get("reset_time")]
-                reset_time = min(reset_times) if reset_times else gemini_models[0].get("reset_time")
-            else:
-                reset_time = gemini_models[0].get("reset_time")
+            reset_times = [m.get("reset_time") for m in gemini_models if m.get("reset_time")]
+            reset_time = min(reset_times) if reset_times else None
 
             aggregated.append({
                 "label": "Gemini",
@@ -996,12 +1011,8 @@ class MacAgentBridge:
 
         if other_models:
             min_frac = min(m.get("remaining_fraction", 1.0) for m in other_models)
-            exhausted = [m for m in other_models if m.get("remaining_fraction", 1.0) <= 0.05]
-            if exhausted:
-                reset_times = [m.get("reset_time") for m in exhausted if m.get("reset_time")]
-                reset_time = min(reset_times) if reset_times else other_models[0].get("reset_time")
-            else:
-                reset_time = other_models[0].get("reset_time")
+            reset_times = [m.get("reset_time") for m in other_models if m.get("reset_time")]
+            reset_time = min(reset_times) if reset_times else None
 
             aggregated.append({
                 "label": "GPT / Claude",

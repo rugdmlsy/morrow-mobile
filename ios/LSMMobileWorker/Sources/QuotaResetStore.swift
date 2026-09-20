@@ -676,7 +676,7 @@ final class QuotaResetStore: ObservableObject {
         guard enableNativeNotifications else { return }
         Task {
             for (acct, accountQuota) in nativeQuotas {
-                for model in accountQuota.displayModels where model.isExhausted {
+                for model in accountQuota.displayModels where (model.isExhausted || model.remainingFraction < 0.95) {
                     guard let resetTime = model.resetTime, resetTime > Date() else { continue }
                     await scheduleNativeResetNotification(account: acct, model: model, resetTime: resetTime)
                 }
