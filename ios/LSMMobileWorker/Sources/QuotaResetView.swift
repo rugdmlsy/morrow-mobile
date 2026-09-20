@@ -69,8 +69,8 @@ struct QuotaResetView: View {
                         .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                         .listRowBackground(Color.clear)
 
-                    // Models Grid/List
-                    ForEach(nativeQuota.models) { modelQuota in
+                    // Models Grid/List (Gemini & GPT/Claude)
+                    ForEach(nativeQuota.displayModels) { modelQuota in
                         nativeModelQuotaRow(modelQuota)
                     }
 
@@ -450,21 +450,45 @@ struct QuotaResetView: View {
         let isEx = model.isExhausted
         let isWarn = model.isWarning
         let rowColor: Color = isEx ? .red : (isWarn ? .orange : .green)
+        let isGemini = model.isGemini
+        let iconName = model.groupIcon
+        let iconColor: Color = isGemini ? .blue : .purple
 
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text(model.label)
-                    .font(.system(size: 14, weight: .semibold))
-                    .lineLimit(1)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: iconName)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(iconColor)
+                    .frame(width: 28, height: 28)
+                    .background(iconColor.opacity(0.12), in: Circle())
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(model.label)
+                        .font(.system(size: 15, weight: .bold))
+                        .lineLimit(1)
+                    if let desc = model.description, !desc.isEmpty {
+                        Text(desc)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Spacer()
-                Text(model.remainingPercentFormatted)
-                    .font(.system(size: 13, weight: .bold, design: .monospaced))
-                    .foregroundStyle(rowColor)
+
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text(model.remainingPercentFormatted)
+                        .font(.system(size: 15, weight: .bold, design: .monospaced))
+                        .foregroundStyle(rowColor)
+                    Text(isEx ? "额度用尽" : (isWarn ? "偏低" : "充裕"))
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(rowColor)
+                }
             }
 
             ProgressView(value: model.remainingFraction)
                 .tint(rowColor)
-                .scaleEffect(x: 1, y: 1.2, anchor: .center)
+                .scaleEffect(x: 1, y: 1.3, anchor: .center)
+                .padding(.vertical, 1)
 
             HStack {
                 if let resetTime = model.resetTime, resetTime > Date() {
@@ -473,7 +497,7 @@ struct QuotaResetView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     Text("倒计时: \(model.formattedCountdown)")
-                        .font(.caption2.weight(.medium))
+                        .font(.caption2.weight(.semibold))
                         .foregroundStyle(rowColor)
                 } else {
                     Text("配额状态稳定")
@@ -486,7 +510,7 @@ struct QuotaResetView: View {
                 }
             }
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
     }
 
     // MARK: - Legacy Active Reminders UI

@@ -614,7 +614,7 @@ class MacAgentBridge:
         url = f"{self.relay_url}{endpoint}"
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "LSM-MacAgentBridge/1.0",
+            "User-Agent": "MorrowMobile/1.0",
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
@@ -944,6 +944,8 @@ class MacAgentBridge:
                                 "reset_time": qi.get("resetTime"),
                             })
 
+                        models = self._aggregate_models(models)
+
                         from datetime import timezone
                         results[acct] = {
                             "account": acct,
@@ -958,6 +960,58 @@ class MacAgentBridge:
                     continue
 
         return results
+
+    @staticmethod
+    def _aggregate_models(raw_models: list) -> list:
+        """Groups models into Gemini and GPT/Claude for clear presentation."""
+        if not raw_models:
+            return []
+
+        gemini_models = [
+            m for m in raw_models
+            if "gemini" in (m.get("label", "") + m.get("model_id", "")).lower()
+        ]
+        other_models = [
+            m for m in raw_models
+            if "gemini" not in (m.get("label", "") + m.get("model_id", "")).lower()
+        ]
+
+        aggregated = []
+        if gemini_models:
+            min_frac = min(m.get("remaining_fraction", 1.0) for m in gemini_models)
+            exhausted = [m for m in gemini_models if m.get("remaining_fraction", 1.0) <= 0.05]
+            if exhausted:
+                reset_times = [m.get("reset_time") for m in exhausted if m.get("reset_time")]
+                reset_time = min(reset_times) if reset_times else gemini_models[0].get("reset_time")
+            else:
+                reset_time = gemini_models[0].get("reset_time")
+
+            aggregated.append({
+                "label": "Gemini",
+                "model_id": "gemini",
+                "description": "Flash & Pro 全系列",
+                "remaining_fraction": min_frac,
+                "reset_time": reset_time,
+            })
+
+        if other_models:
+            min_frac = min(m.get("remaining_fraction", 1.0) for m in other_models)
+            exhausted = [m for m in other_models if m.get("remaining_fraction", 1.0) <= 0.05]
+            if exhausted:
+                reset_times = [m.get("reset_time") for m in exhausted if m.get("reset_time")]
+                reset_time = min(reset_times) if reset_times else other_models[0].get("reset_time")
+            else:
+                reset_time = other_models[0].get("reset_time")
+
+            aggregated.append({
+                "label": "GPT / Claude",
+                "model_id": "gpt-claude",
+                "description": "Claude Opus / Sonnet, GPT-OSS",
+                "remaining_fraction": min_frac,
+                "reset_time": reset_time,
+            })
+
+        return aggregated if aggregated else raw_models
 
     def sync_native_quota(self) -> int:
         """Fetches native Antigravity quota from local language_server and syncs to VPS relay."""

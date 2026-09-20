@@ -46,8 +46,31 @@ struct NativeModelQuota: Identifiable, Codable, Equatable {
     var id: String { modelId.isEmpty ? label : modelId }
     let label: String
     let modelId: String
+    let description: String?
     let remainingFraction: Double
     let resetTime: Date?
+
+    init(
+        label: String,
+        modelId: String,
+        description: String? = nil,
+        remainingFraction: Double,
+        resetTime: Date?
+    ) {
+        self.label = label
+        self.modelId = modelId
+        self.description = description
+        self.remainingFraction = remainingFraction
+        self.resetTime = resetTime
+    }
+
+    var isGemini: Bool {
+        modelId.localizedCaseInsensitiveContains("gemini") || label.localizedCaseInsensitiveContains("gemini")
+    }
+
+    var groupIcon: String {
+        isGemini ? "sparkles" : "brain.head.profile"
+    }
 
     var remainingPercent: Double {
         remainingFraction * 100.0
@@ -108,13 +131,51 @@ struct NativeAccountQuota: Identifiable, Codable, Equatable {
     let models: [NativeModelQuota]
     let updatedAt: Date
 
+    var displayModels: [NativeModelQuota] {
+        if models.count <= 2 && (models.contains(where: { $0.modelId == "gemini" }) || models.contains(where: { $0.modelId == "gpt-claude" })) {
+            return models
+        }
+
+        var groups: [NativeModelQuota] = []
+        let geminiModels = models.filter { $0.isGemini }
+        let otherModels = models.filter { !$0.isGemini }
+
+        if !geminiModels.isEmpty {
+            let minFrac = geminiModels.map(\.remainingFraction).min() ?? 1.0
+            let exhausted = geminiModels.filter(\.isExhausted)
+            let resetDate = (exhausted.compactMap(\.resetTime).min()) ?? (geminiModels.compactMap(\.resetTime).first)
+            groups.append(NativeModelQuota(
+                label: "Gemini",
+                modelId: "gemini",
+                description: "Flash & Pro 全系列",
+                remainingFraction: minFrac,
+                resetTime: resetDate
+            ))
+        }
+
+        if !otherModels.isEmpty {
+            let minFrac = otherModels.map(\.remainingFraction).min() ?? 1.0
+            let exhausted = otherModels.filter(\.isExhausted)
+            let resetDate = (exhausted.compactMap(\.resetTime).min()) ?? (otherModels.compactMap(\.resetTime).first)
+            groups.append(NativeModelQuota(
+                label: "GPT / Claude",
+                modelId: "gpt-claude",
+                description: "Claude Opus / Sonnet, GPT-OSS",
+                remainingFraction: minFrac,
+                resetTime: resetDate
+            ))
+        }
+
+        return groups.isEmpty ? models : groups
+    }
+
     var lowestModel: NativeModelQuota? {
-        models.min { $0.remainingFraction < $1.remainingFraction }
+        displayModels.min { $0.remainingFraction < $1.remainingFraction }
     }
 
     var earliestResetModel: NativeModelQuota? {
-        models.filter { ($0.resetTime ?? .distantPast) > Date() }
-              .min { ($0.resetTime ?? .distantFuture) < ($1.resetTime ?? .distantFuture) }
+        displayModels.filter { ($0.resetTime ?? .distantPast) > Date() }
+                     .min { ($0.resetTime ?? .distantFuture) < ($1.resetTime ?? .distantFuture) }
     }
 
     var isExhausted: Bool {
@@ -534,6 +595,7 @@ final class QuotaResetStore: ObservableObject {
                 for m in rawModels {
                     let label = m["label"] as? String ?? ""
                     let modelId = m["model_id"] as? String ?? ""
+                    let desc = m["description"] as? String
                     let rem = (m["remaining_fraction"] as? NSNumber)?.doubleValue ?? 1.0
                     let resetStr = m["reset_time"] as? String
                     let resetTime = parseIsoDate(resetStr)
@@ -541,6 +603,7 @@ final class QuotaResetStore: ObservableObject {
                         parsedModels.append(NativeModelQuota(
                             label: label,
                             modelId: modelId,
+                            description: desc,
                             remainingFraction: rem,
                             resetTime: resetTime
                         ))
@@ -600,7 +663,7 @@ final class QuotaResetStore: ObservableObject {
         guard enableNativeNotifications else { return }
         Task {
             for (acct, accountQuota) in nativeQuotas {
-                for model in accountQuota.models where model.isExhausted {
+                for model in accountQuota.displayModels where model.isExhausted {
                     guard let resetTime = model.resetTime, resetTime > Date() else { continue }
                     await scheduleNativeResetNotification(account: acct, model: model, resetTime: resetTime)
                 }
