@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Main Chat Tab Root: Telegram Topics-style navigation container.
 struct ChatView: View {
@@ -120,7 +121,7 @@ struct ChatProjectsListView: View {
                 }
             }
         }
-        .navigationTitle("项目 / Projects")
+        .navigationTitle("Project")
         .navigationBarTitleDisplayMode(.large)
         .searchable(text: $searchText, prompt: "搜索项目或对话内容")
         .toolbar {
@@ -1071,10 +1072,7 @@ struct MessageBubbleView: View {
 
                 // Bubble Content
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(message.content)
-                        .font(.body)
-                        .foregroundStyle(isUser ? Color.white : Color.primary)
-                        .textSelection(.enabled)
+                    MarkdownMessageView(content: message.content, isUser: isUser)
 
                     // Optional tool output
                     if let output = message.toolOutput, !output.isEmpty {
@@ -1249,3 +1247,350 @@ struct TypingDotsIndicatorView: View {
         }
     }
 }
+
+// MARK: - Markdown Rendering Engine
+
+enum MarkdownBlock: Identifiable {
+    case codeBlock(id: String, language: String?, code: String)
+    case heading(id: String, level: Int, text: String)
+    case quote(id: String, text: String, alertType: String?)
+    case list(id: String, items: [(bullet: String, text: String)])
+    case divider(id: String)
+    case paragraph(id: String, text: String)
+
+    var id: String {
+        switch self {
+        case .codeBlock(let id, _, _): return id
+        case .heading(let id, _, _): return id
+        case .quote(let id, _, _): return id
+        case .list(let id, _): return id
+        case .divider(let id): return id
+        case .paragraph(let id, _): return id
+        }
+    }
+}
+
+struct MarkdownMessageView: View {
+    let content: String
+    let isUser: Bool
+
+    private var blocks: [MarkdownBlock] {
+        parseMarkdownBlocks(content)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(blocks) { block in
+                renderBlock(block)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func renderBlock(_ block: MarkdownBlock) -> some View {
+        switch block {
+        case .codeBlock(_, let language, let code):
+            CodeBlockCardView(language: language, code: code, isUser: isUser)
+        case .heading(_, let level, let text):
+            Text(LocalizedStringKey(text))
+                .font(headingFont(level: level))
+                .fontWeight(.bold)
+                .foregroundStyle(isUser ? Color.white : Color.primary)
+                .textSelection(.enabled)
+                .padding(.top, level <= 2 ? 4 : 2)
+        case .quote(_, let text, let alertType):
+            AlertCalloutView(text: text, alertType: alertType, isUser: isUser)
+        case .list(_, let items):
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(0..<items.count, id: \.self) { idx in
+                    HStack(alignment: .top, spacing: 6) {
+                        Text(items[idx].bullet)
+                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                            .foregroundStyle(isUser ? Color.white.opacity(0.8) : Color.accentColor)
+                            .frame(minWidth: 16, alignment: .leading)
+                        Text(LocalizedStringKey(items[idx].text))
+                            .font(.body)
+                            .foregroundStyle(isUser ? Color.white : Color.primary)
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        case .divider(_):
+            Divider()
+                .overlay(isUser ? Color.white.opacity(0.3) : Color.secondary.opacity(0.3))
+                .padding(.vertical, 2)
+        case .paragraph(_, let text):
+            Text(LocalizedStringKey(text))
+                .font(.body)
+                .foregroundStyle(isUser ? Color.white : Color.primary)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func headingFont(level: Int) -> Font {
+        switch level {
+        case 1: return .title2
+        case 2: return .title3
+        case 3: return .headline
+        default: return .subheadline
+        }
+    }
+}
+
+struct CodeBlockCardView: View {
+    let language: String?
+    let code: String
+    let isUser: Bool
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(language?.uppercased() ?? "CODE")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(Color.secondary)
+
+                Spacer()
+
+                Button {
+                    UIPasteboard.general.string = code
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        copied = true
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        withAnimation {
+                            copied = false
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 11))
+                        Text(copied ? "已复制" : "复制")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .foregroundStyle(copied ? Color.green : Color.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.white.opacity(0.1))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(Color.black.opacity(0.25))
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(Color(white: 0.92))
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+        }
+        .background(Color(red: 0.12, green: 0.13, blue: 0.16))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+        .padding(.vertical, 3)
+    }
+}
+
+struct AlertCalloutView: View {
+    let text: String
+    let alertType: String?
+    let isUser: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 2)
+                .fill(accentColor)
+                .frame(width: 3)
+
+            VStack(alignment: .leading, spacing: 4) {
+                if let type = alertType {
+                    HStack(spacing: 4) {
+                        Image(systemName: iconName)
+                            .font(.caption2.bold())
+                        Text(type.uppercased())
+                            .font(.caption2.bold())
+                    }
+                    .foregroundStyle(accentColor)
+                }
+                Text(LocalizedStringKey(text))
+                    .font(.subheadline)
+                    .foregroundStyle(isUser ? Color.white.opacity(0.9) : Color.primary)
+                    .textSelection(.enabled)
+            }
+        }
+        .padding(8)
+        .background(accentColor.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .padding(.vertical, 2)
+    }
+
+    private var accentColor: Color {
+        switch alertType?.uppercased() {
+        case "NOTE": return .blue
+        case "TIP": return .green
+        case "IMPORTANT": return .purple
+        case "WARNING": return .orange
+        case "CAUTION": return .red
+        default: return .secondary
+        }
+    }
+
+    private var iconName: String {
+        switch alertType?.uppercased() {
+        case "NOTE": return "info.circle.fill"
+        case "TIP": return "lightbulb.fill"
+        case "IMPORTANT": return "exclamationmark.circle.fill"
+        case "WARNING": return "exclamationmark.triangle.fill"
+        case "CAUTION": return "shield.fill"
+        default: return "quote.opening"
+        }
+    }
+}
+
+func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
+    let lines = raw.components(separatedBy: "\n")
+    var blocks: [MarkdownBlock] = []
+    var i = 0
+    var blockIndex = 0
+
+    while i < lines.count {
+        let line = lines[i]
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+        // 1. Code block fence
+        if trimmed.hasPrefix("```") {
+            let lang = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+            var codeLines: [String] = []
+            i += 1
+            while i < lines.count {
+                if lines[i].trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                    i += 1
+                    break
+                }
+                codeLines.append(lines[i])
+                i += 1
+            }
+            let code = codeLines.joined(separator: "\n")
+            blocks.append(.codeBlock(id: "block_\(blockIndex)", language: lang.isEmpty ? nil : lang, code: code))
+            blockIndex += 1
+            continue
+        }
+
+        // 2. Horizontal divider
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            blocks.append(.divider(id: "block_\(blockIndex)"))
+            blockIndex += 1
+            i += 1
+            continue
+        }
+
+        // 3. Headings (# , ## , ### )
+        if trimmed.hasPrefix("#") {
+            let hashes = trimmed.prefix(while: { $0 == "#" })
+            let level = hashes.count
+            if level <= 6 {
+                let rest = trimmed.dropFirst(level).trimmingCharacters(in: .whitespaces)
+                blocks.append(.heading(id: "block_\(blockIndex)", level: level, text: rest))
+                blockIndex += 1
+                i += 1
+                continue
+            }
+        }
+
+        // 4. Blockquote / GitHub Alert (> )
+        if trimmed.hasPrefix(">") {
+            var quoteLines: [String] = []
+            while i < lines.count && lines[i].trimmingCharacters(in: .whitespaces).hasPrefix(">") {
+                let qLine = String(lines[i].trimmingCharacters(in: .whitespaces).dropFirst()).trimmingCharacters(in: .whitespaces)
+                quoteLines.append(qLine)
+                i += 1
+            }
+            var alertType: String? = nil
+            var cleanText = quoteLines.joined(separator: "\n")
+            if let first = quoteLines.first, first.hasPrefix("[!") && first.contains("]") {
+                if let endBracket = first.firstIndex(of: "]") {
+                    let type = String(first[first.index(after: first.index(after: first.startIndex))..<endBracket])
+                    alertType = type
+                    let remainingFirst = String(first[first.index(after: endBracket)...]).trimmingCharacters(in: .whitespaces)
+                    var newLines = quoteLines
+                    if remainingFirst.isEmpty {
+                        newLines.removeFirst()
+                    } else {
+                        newLines[0] = remainingFirst
+                    }
+                    cleanText = newLines.joined(separator: "\n")
+                }
+            }
+            blocks.append(.quote(id: "block_\(blockIndex)", text: cleanText, alertType: alertType))
+            blockIndex += 1
+            continue
+        }
+
+        // 5. Lists (- , * , 1. )
+        if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || (trimmed.first?.isNumber == true && trimmed.contains(". ")) {
+            var listItems: [(bullet: String, text: String)] = []
+            while i < lines.count {
+                let curr = lines[i].trimmingCharacters(in: .whitespaces)
+                if curr.hasPrefix("- ") || curr.hasPrefix("* ") {
+                    let itemText = String(curr.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                    listItems.append(("•", itemText))
+                    i += 1
+                } else if let dotRange = curr.range(of: ". ") {
+                    let prefixNum = String(curr[..<dotRange.lowerBound])
+                    if Int(prefixNum) != nil {
+                        let itemText = String(curr[dotRange.upperBound...]).trimmingCharacters(in: .whitespaces)
+                        listItems.append(("\(prefixNum).", itemText))
+                        i += 1
+                    } else {
+                        break
+                    }
+                } else {
+                    break
+                }
+            }
+            blocks.append(.list(id: "block_\(blockIndex)", items: listItems))
+            blockIndex += 1
+            continue
+        }
+
+        // 6. Regular paragraph (accumulate consecutive non-empty non-special lines)
+        if trimmed.isEmpty {
+            i += 1
+            continue
+        }
+
+        var paraLines: [String] = []
+        while i < lines.count {
+            let nextTrimmed = lines[i].trimmingCharacters(in: .whitespaces)
+            if nextTrimmed.isEmpty ||
+               nextTrimmed.hasPrefix("```") ||
+               nextTrimmed.hasPrefix("#") ||
+               nextTrimmed.hasPrefix(">") ||
+               nextTrimmed == "---" ||
+               nextTrimmed == "***" ||
+               nextTrimmed.hasPrefix("- ") ||
+               nextTrimmed.hasPrefix("* ") {
+                break
+            }
+            paraLines.append(lines[i])
+            i += 1
+        }
+        if !paraLines.isEmpty {
+            let pText = paraLines.joined(separator: "\n")
+            blocks.append(.paragraph(id: "block_\(blockIndex)", text: pText))
+            blockIndex += 1
+        }
+    }
+
+    return blocks
+}
+
