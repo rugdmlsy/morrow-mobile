@@ -723,6 +723,13 @@ final class MobileChatStore: ObservableObject {
                 }
                 sortSessions()
                 saveSessions()
+
+                // Automatically scan conversation records for quota limits
+                QuotaResetStore.shared.scanAndSyncFromConversations(
+                    messagesBySession: self.messagesBySession,
+                    sessions: self.sessions,
+                    currentAccount: self.currentAccount
+                )
             }
 
             // Immediately ACK to purge copies on VPS!
@@ -895,6 +902,13 @@ final class MobileChatStore: ObservableObject {
                     saveSessions()
                     updateLocalProjectCounts()
                 }
+
+                // Automatically scan conversation records for quota limits
+                QuotaResetStore.shared.scanAndSyncFromConversations(
+                    messagesBySession: self.messagesBySession,
+                    sessions: self.sessions,
+                    currentAccount: self.currentAccount
+                )
             }
         } catch {
             // Background fetch error is non-fatal
@@ -1063,6 +1077,11 @@ final class MobileChatStore: ObservableObject {
             if self.projects.isEmpty {
                 updateLocalProjectCounts()
             }
+            QuotaResetStore.shared.scanAndSyncFromConversations(
+                messagesBySession: self.messagesBySession,
+                sessions: self.sessions,
+                currentAccount: self.currentAccount
+            )
             return
         }
 
