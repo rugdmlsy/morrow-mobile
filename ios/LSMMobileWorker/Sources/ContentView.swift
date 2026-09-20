@@ -11,6 +11,11 @@ struct ContentView: View {
 
     var body: some View {
         TabView {
+            ChatView(model: model)
+                .tabItem {
+                    Label("Chat", systemImage: "bubble.left.and.bubble.right.fill")
+                }
+
             NavigationStack {
                 WorkerHomeView(
                     model: model,
