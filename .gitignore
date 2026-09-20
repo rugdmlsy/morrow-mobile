@@ -1,0 +1,39 @@
+.DS_Store
+*.swp
+*~
+
+# Xcode and Swift
+.build/
+build/
+DerivedData/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+**/xcuserdata/
+*.xccheckout
+*.moved-builder
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# XcodeGen output and temporary build files
+ios/LSMMobileWorker/LSMMobileWorker.xcodeproj/
+ios/LSMMobileWorker/Sources/Info.plist
+ios/LSMMobileWorker/Sources/Info-Share.plist
+ios/LSMMobileWorker/ShareExtension/Info.plist
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
