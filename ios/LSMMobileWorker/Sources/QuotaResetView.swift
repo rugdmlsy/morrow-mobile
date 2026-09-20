@@ -12,7 +12,7 @@ struct QuotaResetView: View {
 
     var body: some View {
         List {
-            // 1. Notification Permission Notice (if not granted)
+            // 1. Notification Permission Notice
             if !store.notificationAuthorized {
                 Section {
                     HStack(spacing: 12) {
@@ -22,7 +22,7 @@ struct QuotaResetView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("未开启系统通知权限")
                                 .font(.system(size: 15, weight: .semibold))
-                            Text("开启后，当模型配额到期重置时，即使锁屏也会收到本地推送。")
+                            Text("开启后，额度到期重置时即使锁屏也会准时收到本地推送。")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -50,61 +50,66 @@ struct QuotaResetView: View {
                     Spacer()
                     Picker("账号", selection: $selectedAccount) {
                         ForEach(availableAccounts, id: \.self) { acct in
-                            Text(accountDisplayName(acct)).tag(acct)
+                            Text(acct).tag(acct)
                         }
                     }
                     .pickerStyle(.menu)
                 }
             } header: {
-                Text("选择账号")
+                Text("监控账号")
+            } footer: {
+                Text("由 Mac 桥接器直接对接本地 Antigravity 核心引擎，自动上报权威原生配额。")
             }
 
-            // 3. User Info Overview Card
-            if let nativeQuota = currentNativeQuota {
-                Section {
-                    accountOverviewCard(nativeQuota)
+            // 3. Native Real-Time Quota & Reset Timers (原生精确配额与重置时间)
+            Section {
+                if let nativeQuota = currentNativeQuota {
+                    nativeQuotaOverviewCard(nativeQuota)
                         .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                         .listRowBackground(Color.clear)
-                }
-            }
 
-            // 4. Two Model Quota Cards: Gemini & GPT/Claude
-            Section {
-                if let nativeQuota = currentNativeQuota, !nativeQuota.displayModels.isEmpty {
+                    // Models Grid/List (Gemini & GPT/Claude)
                     ForEach(nativeQuota.displayModels) { modelQuota in
-                        modelQuotaCard(modelQuota)
-                            .listRowInsets(EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16))
-                            .listRowBackground(Color.clear)
+                        nativeModelQuotaRow(modelQuota)
                     }
+
+                    // Notification toggle
+                    Toggle(isOn: $store.enableNativeNotifications) {
+                        Label("额度恢复时自动发送系统推送", systemImage: "bell.badge.fill")
+                            .font(.system(size: 14, weight: .medium))
+                    }
+                    .tint(.blue)
+                    .padding(.vertical, 2)
                 } else {
                     emptyQuotaStateView
                 }
             } header: {
                 HStack {
-                    Text("模型额度与重置时间")
+                    Label("Antigravity 原生配额与恢复时间", systemImage: "speedometer")
                     Spacer()
-                    if store.isFetchingNativeQuota {
-                        ProgressView()
-                            .controlSize(.mini)
+                    Button {
+                        refreshNativeQuota()
+                    } label: {
+                        HStack(spacing: 4) {
+                            if store.isFetchingNativeQuota {
+                                ProgressView()
+                                    .controlSize(.mini)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                            Text("刷新")
+                        }
+                        .font(.caption2)
                     }
                 }
             } footer: {
                 if let nativeQuota = currentNativeQuota {
                     Text("最近同步：\(formattedUpdateTime(nativeQuota.updatedAt)) · 准确度 100%（官方 RPC 实时数据）")
-                } else {
-                    Text("由 Mac 本地 Antigravity 核心引擎自动上报，无需手动计算。")
                 }
             }
 
-            // 5. Notification Settings & Actions
+            // 4. Notification & Testing
             Section {
-                Toggle(isOn: $store.enableNativeNotifications) {
-                    Label("额度恢复时自动发送系统推送", systemImage: "bell.badge.fill")
-                        .font(.system(size: 15, weight: .medium))
-                }
-                .tint(.blue)
-                .padding(.vertical, 2)
-
                 Button {
                     Task {
                         await store.triggerTestNotification()
@@ -133,12 +138,43 @@ struct QuotaResetView: View {
                 }
                 .foregroundStyle(.blue)
             } header: {
-                Text("通知与同步")
+                Text("通知与测试")
             }
         }
-        .navigationTitle("额度重置监控")
+        .navigationTitle("额度重置提醒")
         .refreshable {
             await store.fetchNativeQuota(server: model.server, token: model.activeIdentity?.token, account: selectedAccount)
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button {
+                        refreshNativeQuota()
+                    } label: {
+                        Label("立即同步原生额度", systemImage: "speedometer")
+                    }
+
+                    Button {
+                        Task {
+                            await store.triggerTestNotification()
+                            showBanner("已发送测试通知，请留意 2 秒后的系统推送！")
+                        }
+                    } label: {
+                        Label("发送测试推送", systemImage: "bell.badge")
+                    }
+
+                    Button {
+                        Task {
+                            _ = await store.requestNotificationPermission()
+                        }
+                    } label: {
+                        Label("检查通知权限", systemImage: "gearshape")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+            }
         }
         .onAppear {
             if let curr = model.activeIdentity?.name, !curr.isEmpty {
@@ -168,7 +204,11 @@ struct QuotaResetView: View {
         }
     }
 
-    // MARK: - Subviews
+    // MARK: - Native Quota UI Components (原生配额组件)
+
+    private var currentNativeQuota: NativeAccountQuota? {
+        store.nativeQuotas[selectedAccount] ?? store.nativeQuotas[selectedAccount.lowercased()]
+    }
 
     private var emptyQuotaStateView: some View {
         VStack(spacing: 12) {
@@ -177,7 +217,7 @@ struct QuotaResetView: View {
                 .foregroundStyle(.secondary)
             Text("尚未获取到 \(selectedAccount) 的原生配额")
                 .font(.system(size: 15, weight: .semibold))
-            Text("请确保 Mac 本地 Antigravity 正在运行，且桥接服务已启动。")
+            Text("请确保 Mac 本地 Antigravity 正在运行，且桥接器正常连接。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -195,82 +235,142 @@ struct QuotaResetView: View {
             .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
+        .padding(.vertical, 16)
         .listRowBackground(Color.clear)
     }
 
     @ViewBuilder
-    private func accountOverviewCard(_ quota: NativeAccountQuota) -> some View {
+    private func nativeQuotaOverviewCard(_ quota: NativeAccountQuota) -> some View {
         let isExhausted = quota.isExhausted
         let isWarning = quota.isWarning
         let themeColor: Color = isExhausted ? .red : (isWarning ? .orange : .green)
 
-        HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(themeColor.opacity(0.15))
-                    .frame(width: 44, height: 44)
+        VStack(alignment: .leading, spacing: 12) {
+            // Account Info & Tier (Original clean icon & layout)
+            HStack(alignment: .center, spacing: 10) {
                 Image(systemName: "person.crop.circle.badge.checkmark")
-                    .font(.system(size: 22))
+                    .font(.system(size: 24))
+                    .foregroundStyle(themeColor)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(quota.email ?? quota.name ?? quota.account)
+                            .font(.system(size: 15, weight: .bold))
+                            .lineLimit(1)
+
+                        if let tier = quota.tier, !tier.isEmpty {
+                            Text(tier)
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.blue.opacity(0.15), in: Capsule())
+                                .foregroundStyle(Color.blue)
+                        }
+                    }
+
+                    Text("官方原生鉴权账号 · \(quota.account)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                // Health Badge
+                Text(isExhausted ? "配额耗尽" : (isWarning ? "配额偏低" : "状态正常"))
+                    .font(.caption2.weight(.bold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(themeColor.opacity(0.15), in: Capsule())
                     .foregroundStyle(themeColor)
             }
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(quota.email ?? quota.name ?? quota.account)
-                        .font(.system(size: 15, weight: .bold))
-                        .lineLimit(1)
+            Divider()
 
-                    if let tier = quota.tier, !tier.isEmpty {
-                        Text(tier)
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.blue.opacity(0.12), in: Capsule())
-                            .foregroundStyle(Color.blue)
+            // Lowest model or Earliest Reset
+            if isExhausted, let lowest = quota.lowestModel, let resetTime = lowest.resetTime {
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("受限模型恢复倒计时")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(lowest.formattedCountdown)
+                            .font(.system(size: 26, weight: .heavy, design: .monospaced))
+                            .foregroundStyle(.red)
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("官方精确重置点")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(lowest.formattedResetTime)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.primary)
                     }
                 }
 
-                Text(quota.account == "antigravity-0" ? "工作主账号 (Work)" : "个人独立账号 (Personal)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Image(systemName: "bell.badge.fill")
+                        .foregroundStyle(.blue)
+                        .font(.caption2)
+                    Text("到期重置时，iOS 将准时弹出系统通知。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("主模型可用配额")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        let lowestFraction = quota.lowestModel?.remainingPercentFormatted ?? "100.0%"
+                        Text(lowestFraction)
+                            .font(.system(size: 24, weight: .bold, design: .rounded))
+                            .foregroundStyle(themeColor)
+                    }
+                    Spacer()
+                    if let earliest = quota.earliestResetModel, earliest.timeRemaining > 0 {
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("预计滚动恢复")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(earliest.formattedResetTime)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             }
-
-            Spacer()
-
-            Text(isExhausted ? "配额耗尽" : (isWarning ? "配额偏低" : "状态良好"))
-                .font(.caption2.weight(.bold))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(themeColor.opacity(0.12), in: Capsule())
-                .foregroundStyle(themeColor)
         }
         .padding(14)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
-        .shadow(color: Color.black.opacity(0.03), radius: 4, y: 1)
+        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(themeColor.opacity(0.3), lineWidth: 1.5)
+        )
+        .shadow(color: Color.black.opacity(0.04), radius: 6, y: 2)
     }
 
     @ViewBuilder
-    private func modelQuotaCard(_ model: NativeModelQuota) -> some View {
+    private func nativeModelQuotaRow(_ model: NativeModelQuota) -> some View {
         let isEx = model.isExhausted
         let isWarn = model.isWarning
-        let statusColor: Color = isEx ? .red : (isWarn ? .orange : .green)
+        let rowColor: Color = isEx ? .red : (isWarn ? .orange : .green)
         let isGemini = model.isGemini
         let iconName = model.groupIcon
         let iconColor: Color = isGemini ? .blue : .purple
 
-        VStack(alignment: .leading, spacing: 10) {
-            // Header: Icon + Title + Percent
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 Image(systemName: iconName)
-                    .font(.system(size: 16, weight: .bold))
+                    .font(.system(size: 15, weight: .bold))
                     .foregroundStyle(iconColor)
-                    .frame(width: 32, height: 32)
+                    .frame(width: 28, height: 28)
                     .background(iconColor.opacity(0.12), in: Circle())
 
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(model.label)
-                        .font(.system(size: 16, weight: .bold))
+                        .font(.system(size: 15, weight: .bold))
+                        .lineLimit(1)
                     if let desc = model.description, !desc.isEmpty {
                         Text(desc)
                             .font(.system(size: 11))
@@ -280,64 +380,42 @@ struct QuotaResetView: View {
 
                 Spacer()
 
-                VStack(alignment: .trailing, spacing: 2) {
+                VStack(alignment: .trailing, spacing: 1) {
                     Text(model.remainingPercentFormatted)
-                        .font(.system(size: 20, weight: .bold, design: .rounded))
-                        .foregroundStyle(statusColor)
-
-                    Text(isEx ? "配额已用尽" : (isWarn ? "余量偏低" : "余量充足"))
+                        .font(.system(size: 15, weight: .bold, design: .monospaced))
+                        .foregroundStyle(rowColor)
+                    Text(isEx ? "额度用尽" : (isWarn ? "偏低" : "充裕"))
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(statusColor)
+                        .foregroundStyle(rowColor)
                 }
             }
 
-            // Progress Bar
-            ProgressView(value: min(1.0, max(0.0, model.remainingFraction)))
-                .tint(statusColor)
-                .scaleEffect(x: 1, y: 1.4, anchor: .center)
-                .padding(.vertical, 2)
+            ProgressView(value: model.remainingFraction)
+                .tint(rowColor)
+                .scaleEffect(x: 1, y: 1.3, anchor: .center)
+                .padding(.vertical, 1)
 
-            // Reset Info / Live Countdown
-            HStack(alignment: .center) {
-                if let resetTime = model.resetTime, resetTime > Date(), model.remainingFraction < 0.99 {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("重置时间: \(model.formattedResetTime)")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Spacer()
-
-                    HStack(spacing: 4) {
-                        Image(systemName: "timer")
-                            .font(.caption2)
-                        Text(model.formattedCountdown)
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(statusColor.opacity(0.12), in: Capsule())
-                    .foregroundStyle(statusColor)
-                } else {
-                    Text("当前额度充足，随时可调用")
+            HStack {
+                if let resetTime = model.resetTime, resetTime > Date() {
+                    Text("重置时间: \(model.formattedResetTime)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-
                     Spacer()
-
-                    Text("可正常使用")
-                        .font(.caption2.weight(.medium))
+                    Text("倒计时: \(model.formattedCountdown)")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(rowColor)
+                } else {
+                    Text("配额状态稳定")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("随时可用")
+                        .font(.caption2)
                         .foregroundStyle(.green)
                 }
             }
         }
-        .padding(14)
-        .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 14))
-        .overlay(
-            RoundedRectangle(cornerRadius: 14)
-                .stroke(statusColor.opacity(isEx ? 0.4 : 0.15), lineWidth: isEx ? 1.5 : 1)
-        )
-        .shadow(color: Color.black.opacity(0.03), radius: 4, y: 1)
+        .padding(.vertical, 6)
     }
 
     // MARK: - Helpers
@@ -348,19 +426,6 @@ struct QuotaResetView: View {
         set.insert("antigravity-0")
         set.insert("antigravity-1")
         return Array(set).filter { !$0.isEmpty }.sorted()
-    }
-
-    private var currentNativeQuota: NativeAccountQuota? {
-        store.nativeQuotas[selectedAccount] ?? store.nativeQuotas[selectedAccount.lowercased()]
-    }
-
-    private func accountDisplayName(_ acct: String) -> String {
-        if let q = store.nativeQuotas[acct], let email = q.email, !email.isEmpty {
-            return "\(acct) (\(email))"
-        }
-        if acct == "antigravity-0" { return "antigravity-0 (Work)" }
-        if acct == "antigravity-1" { return "antigravity-1 (Personal)" }
-        return acct
     }
 
     private func refreshNativeQuota() {
