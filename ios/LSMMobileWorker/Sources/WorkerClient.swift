@@ -164,7 +164,20 @@ struct LSMHTTPClient {
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        let (body, response) = try await URLSession.shared.data(for: request)
+        let (body, response): (Data, URLResponse)
+        do {
+            (body, response) = try await URLSession.shared.data(for: request)
+        } catch {
+            if base.contains("mobile.xycdev.com"),
+               let fallbackUrl = URL(string: base.replacingOccurrences(of: "mobile.xycdev.com", with: "mobile.51-79-159-224.sslip.io") + path) {
+                var fbReq = request
+                fbReq.url = fallbackUrl
+                (body, response) = try await URLSession.shared.data(for: fbReq)
+            } else {
+                throw error
+            }
+        }
+
         guard let http = response as? HTTPURLResponse else {
             throw WorkerClientError.invalidResponse
         }
@@ -210,7 +223,12 @@ final class WorkerViewModel: ObservableObject {
     private var sessionSettings = WorkerSessionSettings(pollTimeout: 20, heartbeatInterval: 10)
 
     init() {
-        server = UserDefaults.standard.string(forKey: "controller.server") ?? "https://mcp.xycdev.com"
+        var savedServer = UserDefaults.standard.string(forKey: "controller.server") ?? "https://mobile.xycdev.com"
+        if savedServer == "https://mcp.xycdev.com" {
+            savedServer = "https://mobile.xycdev.com"
+            UserDefaults.standard.set(savedServer, forKey: "controller.server")
+        }
+        server = savedServer
         workerName = UserDefaults.standard.string(forKey: "worker.name") ?? "morrow-iphone"
         reloadAccounts()
     }

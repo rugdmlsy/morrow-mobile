@@ -645,7 +645,20 @@ final class QuotaResetStore: ObservableObject {
         }
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response): (Data, URLResponse)
+            do {
+                (data, response) = try await URLSession.shared.data(for: request)
+            } catch {
+                if urlStr.contains("mobile.xycdev.com"),
+                   let fallbackUrl = URL(string: urlStr.replacingOccurrences(of: "mobile.xycdev.com", with: "mobile.51-79-159-224.sslip.io")) {
+                    var fbReq = request
+                    fbReq.url = fallbackUrl
+                    (data, response) = try await URLSession.shared.data(for: fbReq)
+                } else {
+                    throw error
+                }
+            }
+
             guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
                 return
             }

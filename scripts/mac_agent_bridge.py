@@ -631,6 +631,18 @@ class MacAgentBridge:
             logger.error(f"HTTP {err.code} on {endpoint}: {err_body}")
             raise
         except Exception as exc:
+            # Automatic fallback to sslip.io while DNS propagates for mobile.xycdev.com
+            if "mobile.xycdev.com" in self.relay_url:
+                try:
+                    fb_url = url.replace("mobile.xycdev.com", "mobile.51-79-159-224.sslip.io")
+                    fb_req = urllib.request.Request(fb_url, data=data, headers=headers, method=method)
+                    with urllib.request.urlopen(fb_req, timeout=30) as resp:
+                        raw = resp.read().decode("utf-8")
+                        self.relay_url = "https://mobile.51-79-159-224.sslip.io"
+                        logger.info("Using https://mobile.51-79-159-224.sslip.io until mobile.xycdev.com DNS is active")
+                        return json.loads(raw)
+                except Exception:
+                    pass
             logger.debug(f"Network error on {endpoint}: {exc}")
             raise
 
@@ -856,40 +868,28 @@ class MacAgentBridge:
         return total_synced
 
     def get_native_quota_status(self) -> dict[str, Any]:
-        """Discovers running Antigravity language_server instances and queries GetUserStatus."""
+        """Queries local language_server processes for native Antigravity quota information."""
         servers = []
         try:
-            out = subprocess.check_output(["ps", "-ww", "-eo", "pid,ppid,command"], text=True)
-            for line in out.strip().split("\n"):
+            out = subprocess.check_output(["ps", "-ef"], text=True)
+            for line in out.splitlines():
                 if "language_server" in line and "--csrf_token" in line:
-                    parts = line.strip().split(None, 2)
-                    if len(parts) < 3:
+                    parts = line.split()
+                    pid = parts[1]
+                    m_token = re.search(r"--csrf_token\s+([a-f0-9\-]+)", line)
+                    if not m_token:
                         continue
-                    pid = int(parts[0])
-                    ppid = int(parts[1])
-                    cmd = parts[2]
-                    csrf_match = re.search(r"--csrf_token\s+([a-f0-9\-]+)", cmd)
-                    csrf_token = csrf_match.group(1) if csrf_match else None
-                    if not csrf_token:
-                        continue
+                    csrf_token = m_token.group(1)
+                    account = "antigravity-1" if "antigravity-personal" in line.lower() else "antigravity-0"
 
-                    parent_cmd = ""
-                    try:
-                        p_out = subprocess.check_output(["ps", "-o", "command=", "-p", str(ppid)], text=True)
-                        parent_cmd = p_out.strip()
-                    except Exception:
-                        pass
-
-                    account = "antigravity-1" if "Antigravity-Personal" in parent_cmd or "Antigravity-Personal" in cmd else "antigravity-0"
-
-                    ports = []
+                    ports: list[int] = []
                     try:
                         lsof_out = subprocess.check_output(
-                            ["lsof", "-nP", "-a", "-p", str(pid), "-iTCP", "-sTCP:LISTEN"],
+                            ["lsof", "-a", "-p", pid, "-iTCP", "-sTCP:LISTEN", "-Fn"],
                             text=True,
                         )
-                        for l in lsof_out.strip().split("\n"):
-                            m = re.search(r":(\d+)\s+\(LISTEN\)", l)
+                        for pline in lsof_out.splitlines():
+                            m = re.search(r":(\d+)$", pline)
                             if m:
                                 ports.append(int(m.group(1)))
                     except Exception:
@@ -1020,7 +1020,7 @@ class MacAgentBridge:
             return 0
         try:
             res = self._request("/api/chat/sync-quota", payload={"quotas": quotas})
-            synced = res.get("data", {}).get("synced", len(quotas))
+            synced = res.get("data", {}).get("saved", len(quotas))
             logger.info(f"Synced native quota for {len(quotas)} account(s) to VPS relay.")
             return synced
         except Exception as exc:
@@ -1226,7 +1226,7 @@ class MacAgentBridge:
                     break
                 time.sleep(1.0)
 
-            # 7. Proactively trigger project conversation sync for this account
+            # 7. Proactively trigger project conversation sync and quota sync for this account
             try:
                 self.sync_project_conversations(account=profile["account"], force=True)
                 self._last_conv_sync_time = time.time()
@@ -1288,7 +1288,7 @@ class MacAgentBridge:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="LSM MacBook Local Agent Bridge")
-    parser.add_argument("--relay-url", default="http://127.0.0.1:8765", help="VPS Relay API URL")
+    parser.add_argument("--relay-url", default="https://mobile.xycdev.com", help="VPS Relay API URL")
     parser.add_argument("--token", default=None, help="Bearer authorization token")
     parser.add_argument("--session-id", default=None, help="Filter to specific session ID")
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Polling interval in seconds")

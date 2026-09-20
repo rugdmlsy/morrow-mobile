@@ -1146,7 +1146,19 @@ final class MobileChatStore: ObservableObject {
         }
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp): (Data, URLResponse)
+        do {
+            (data, resp) = try await URLSession.shared.data(for: req)
+        } catch {
+            if base.contains("mobile.xycdev.com"),
+               let fallbackUrl = URL(string: base.replacingOccurrences(of: "mobile.xycdev.com", with: "mobile.51-79-159-224.sslip.io") + path) {
+                var fbReq = req
+                fbReq.url = fallbackUrl
+                (data, resp) = try await URLSession.shared.data(for: fbReq)
+            } else {
+                throw error
+            }
+        }
         guard let http = resp as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
         }

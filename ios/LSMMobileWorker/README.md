@@ -183,7 +183,7 @@ Morrow Mobile includes a native AI quota reset notification system:
 3. Tap **Pair & Connect**. The controller-issued token is stored in Keychain.
 4. Later launches call `/remote/resume` automatically.
 
-The current deployment uses `https://mcp.xycdev.com` as the phone-reachable controller URL.
+The current deployment uses `https://mobile.xycdev.com` as the phone-reachable relay URL.
 
 ## Security and privacy model
 

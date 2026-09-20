@@ -672,7 +672,7 @@ struct AddAccountSheet: View {
     @ObservedObject var model: WorkerViewModel
     @Environment(\.dismiss) private var dismiss
 
-    @State private var server: String = "https://mcp.xycdev.com"
+    @State private var server: String = "https://mobile.xycdev.com"
     @State private var workerName: String = "morrow-iphone"
     @State private var invite: String = ""
     @State private var isPairing: Bool = false

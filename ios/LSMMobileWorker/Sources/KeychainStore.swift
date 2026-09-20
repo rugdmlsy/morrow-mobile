@@ -89,7 +89,10 @@ enum KeychainStore {
         // Deduplicate and normalize by lowercase account name
         var seenNames = Set<String>()
         var list: [WorkerIdentity] = []
-        var baseServer = current?.server ?? "https://mcp.xycdev.com"
+        var baseServer = current?.server ?? "https://mobile.xycdev.com"
+        if baseServer == "https://mcp.xycdev.com" {
+            baseServer = "https://mobile.xycdev.com"
+        }
         var baseToken = current?.token ?? ""
 
         for item in rawList {
@@ -98,11 +101,15 @@ enum KeychainStore {
             let key = normName.lowercased()
             if !seenNames.contains(key) {
                 seenNames.insert(key)
-                let normItem = WorkerIdentity(server: item.server, name: normName, token: item.token)
+                var itemServer = item.server
+                if itemServer == "https://mcp.xycdev.com" {
+                    itemServer = "https://mobile.xycdev.com"
+                }
+                let normItem = WorkerIdentity(server: itemServer, name: normName, token: item.token)
                 list.append(normItem)
                 if baseToken.isEmpty && !item.token.isEmpty {
                     baseToken = item.token
-                    baseServer = item.server
+                    baseServer = itemServer
                 }
             }
         }
@@ -145,8 +152,13 @@ enum KeychainStore {
             return nil
         }
         let cleanName = identity.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        if cleanName.isEmpty || cleanName == "morrow-iphone" || cleanName == "default" {
-            let normalized = WorkerIdentity(server: identity.server, name: "antigravity-0", token: identity.token)
+        let normName = (cleanName.isEmpty || cleanName == "morrow-iphone" || cleanName == "default") ? "antigravity-0" : cleanName
+        var normServer = identity.server
+        if normServer == "https://mcp.xycdev.com" {
+            normServer = "https://mobile.xycdev.com"
+        }
+        if normName != identity.name || normServer != identity.server {
+            let normalized = WorkerIdentity(server: normServer, name: normName, token: identity.token)
             if let normData = try? JSONEncoder().encode(normalized) {
                 try? saveRaw(normData, account: account)
             }

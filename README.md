@@ -102,7 +102,7 @@ To bridge your iPhone conversations with Mac's Antigravity:
 
 ```bash
 # Run in foreground for testing
-python3 scripts/mac_agent_bridge.py --relay-url https://mcp.xycdev.com
+python3 scripts/mac_agent_bridge.py --relay-url https://mobile.xycdev.com
 
 # Or register as a macOS background LaunchAgent:
 # ~/Library/LaunchAgents/com.xycdev.mac-agent-bridge.plist
